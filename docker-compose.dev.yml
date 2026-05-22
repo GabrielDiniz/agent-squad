@@ -1,0 +1,24 @@
+# Compose override para desenvolvimento local com hot-reload.
+# Uso: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# O que muda em relação ao compose de produção:
+#   - build target: dev (inclui devDependencies / tsx)
+#   - pasta local montada em /app para hot-reload
+#   - node_modules do container preservado via volume anônimo
+#   - NODE_ENV=development
+
+services:
+  agent:
+    build:
+      context: .
+      target: dev          # estágio dev do Dockerfile
+    command: npm run dev   # garante tsx watch mesmo se imagem cacheada for outra
+    ports:
+      - "${WEBHOOK_PORT:-3001}:${WEBHOOK_PORT:-3001}"
+    volumes:
+      - .:/app             # pasta local → /app (hot-reload ao salvar)
+      - /app/node_modules  # preserva node_modules instalado na imagem
+      - workspace:/workspace
+    environment:
+      NODE_ENV: development
+    restart: "no"
