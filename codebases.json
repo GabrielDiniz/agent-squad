@@ -1,0 +1,101 @@
+{
+  "codebases": [
+    {
+      "name": "versa-saude",
+      "path": "/workspace/versa-saude",
+      "description": "Aplicação web monolítica em Laravel + MySQL, padrão MVC. Estrutura flat: Controllers em app/Http/Controllers, Models em app/Models, Services em app/Services, Repositories em app/Repositories. Módulos identificados por prefixo de nome de classe, sem subpastas dedicadas (exceto Upa, Agenda, VersaSocial e Api).",
+      "modules": [
+        {
+          "name": "regulacao",
+          "description": "Regulação de marcações: cotas, procedimentos, prestadores e profissionais de saúde. Rotas: /regulacao, /regulacao-quantitativa, /marcacao, /marcacao-pendencias, /marcacao-agrupada, /marcacao-arquivos, /cota, /cota-procedimento, /prestador, /procedimento.",
+          "keywords": ["Regulacao", "Marcacao", "Cota", "Prestador", "CotaProcedimento", "RegulacaoQuantitativa", "MarcacaoPendencia", "MarcacaoAgrupada"]
+        },
+        {
+          "name": "tfd",
+          "description": "Tratamento Fora de Domicílio: marcações, guias, viagens, calendário e solicitações de TFD. Rotas: /marcacao-tfd, /guia-tfd, /cidadao-agendamento-tfd, /viagens-tfd, /calendario-viagens, /solicitacoes-viagens, /registros-viagens.",
+          "keywords": ["Tfd", "MarcacaoTFD", "ViagemTfd", "GuiaTfd", "CidadaoAgendamentoTFD", "ViagensTfd", "SolicitacaoExtraordinaria"]
+        },
+        {
+          "name": "transporte",
+          "description": "Gestão de frota: veículos, abastecimento, manutenção, multas, rotas e profissionais de transporte. Rotas: /veiculo, /abastecimento-veiculo, /manutencao-veiculo, /multa-veiculo, /rota-veiculo, /profissionais-transporte.",
+          "keywords": ["Veiculo", "ProfissionalTransporte", "Abastecimento", "Manutencao", "VeiculoRota", "VeiculoMulta"]
+        },
+        {
+          "name": "bpa",
+          "description": "Boletim de Produção Ambulatorial: geração de arquivo BPA, integração com e-SUS, BPA de UPA e de transporte. Rota: /bpa.",
+          "keywords": ["Bpa", "BpaService", "BpaTransporte", "BpaUpa", "BpaEspecialidade"]
+        },
+        {
+          "name": "almoxarifado",
+          "description": "Almoxarifado e controle de estoque: produtos, lotes, solicitações internas, distribuições, devoluções, fornecedores. Rotas: /estoque, /ubs-estoque, /produtos, /produtos-lote, /produtos-solicitacao, /distribuicoes-internas, /solicitacoes-internas, /devolucao-produto, /fornecedor, /grupo-material.",
+          "keywords": ["Estoque", "Produto", "ProdutosLote", "ProdutosSolicitacao", "DevolucaoProduto", "DistribuicoesInternas", "SolicitacoesInternas", "Fornecedor", "GrupoMaterial", "ReivindicacaoDistribuicao"]
+        },
+        {
+          "name": "farmacia",
+          "description": "Farmácia: dispensação, tratamento contínuo, princípios ativos, solicitações de medicamentos, prescrições. Rotas: /dispensacao, /tratamento-continuo, /principios-ativos, /medicamentos-solicitacao, /procura-medicamento, /prescricao-medicamento.",
+          "keywords": ["Dispensacao", "TratamentoContinuo", "PrincipiosAtivo", "MedicamentosSolicitacao", "PrescricaoMedicamento", "RegistroProcuraMedicamentos"]
+        },
+        {
+          "name": "agendamento",
+          "description": "Agenda de consultas: agenda por profissional e recepção, configuração de agenda, agendamentos agrupados e e-SUS. Rotas: /agenda-profissional, /agenda-recepcao, /configuracao-agenda, /agendamentos-agrupados, /agendamento-esus, /cidadao-agendamento.",
+          "keywords": ["Agenda", "AgendaMunicipio", "Agendamento", "ConfiguracaoAgenda", "AgendamentoAgrupado", "AgendamentoEsus"]
+        },
+        {
+          "name": "prontuario",
+          "description": "Prontuário eletrônico (SOAP): consultas, atendimentos, escuta inicial, alergias, atestados, exames, lembretes, orientações, encaminhamentos, evolução odontológica, problemas/condições. Rotas: /prontuario, /consulta, /atendimento, /escuta-inicial, /alergias, /atestados, /exames-requisicao, /exames-solicitados-avaliados, /lembretes, /orientacoes, /encaminhamentos, /evolucao-odonto, /problemas-condicoes.",
+          "keywords": ["Prontuario", "Consulta", "Atendimento", "Alergias", "Atestado", "Exame", "Lembrete", "Encaminhamento", "EvolucaoOdonto", "EscutaInicial", "ProblemaCondicao", "Orientacao", "HistoricoService"]
+        },
+        {
+          "name": "atendimento_especializado",
+          "description": "Atendimento especializado ambulatorial: APAC/LAUDO e guia Susfácil. Rotas: /laudo-apac, /guia-susfacil.",
+          "keywords": ["AtendimentoEspecializado", "LaudoApac", "GuiaSusfacil"]
+        },
+        {
+          "name": "upa",
+          "description": "Unidade de Pronto Atendimento: triagem, recepção, atendimento, internação, medicação, SAE, prescrição, exame, AIH, CCIH, assinatura. Controllers em app/Http/Controllers/Upa/, Services em app/Services/Upa/. Rotas: /upa-*.",
+          "keywords": ["Upa", "GuiaAih", "GuiaCcih"]
+        },
+        {
+          "name": "esus_cds",
+          "description": "Integração e-SUS/CDS: cadastro individual, domicílios, visitas domiciliares, sincronização com RNDS, encaminhamentos e-SUS. Rotas: /esus, /esus-sincronizacao, /cds-cadastro-individual, /cds-domicilio, /cds-visita-domiciliar, /cds-inconsistencias, /integracao-esus, /encaminhamentos-esus.",
+          "keywords": ["Esus", "Cds", "CadastroIndividual", "VisitaDomiciliar", "EsusSincronizacao", "IntegracaoEsus", "EncaminhamentosEsus", "Xml"]
+        },
+        {
+          "name": "cidadao",
+          "description": "Cadastro e gestão de cidadãos: perfil, atualização cadastral, integração CADSUS, unificação de registros. Rotas: /cidadao, /cadsus, /cidadao-atualizacao.",
+          "keywords": ["Cidadao", "Cadsus", "CidadaoAtualizacao", "CidadaoSyncService", "CidadaoUnificado"]
+        },
+        {
+          "name": "vigilancia_sanitaria",
+          "description": "Vigilância Sanitária: estabelecimentos, categorias, inspeções, protocolos, alvarás e seus arquivos. Classes prefixadas com ViSa. Rotas: /estabelecimentos, /categorias-estabelecimentos, /inspecoes, /protocolos, /alvaras, /arquivos-*.",
+          "keywords": ["ViSa", "Alvara", "Estabelecimento", "Inspecao", "Protocolo"]
+        },
+        {
+          "name": "vigilancia_epidemiologica",
+          "description": "Vigilância Epidemiológica (ACE): imóveis, localidades, visitas endêmicas, rotas, supervisão, laboratório, mapas epidemiológicos. Rotas: /localidades, /imoveis, /rotas-ace, /visitas-endemicas, /supervisao, /laboratorio, /mapas-epidemiologicos.",
+          "keywords": ["VigilanciaSaude", "VigilaciaSaude", "MapasEpidemiologicos", "Endemica", "Imovel", "Laboratorio", "RotaAce", "QuarteiraoConcluidoCiclo"]
+        },
+        {
+          "name": "versa_social",
+          "description": "Módulo em desenvolvimento: referência e contrarreferência entre serviços de saúde. Controllers em app/Http/Controllers/VersaSocial/, Services em app/Services/VersaSocial/.",
+          "keywords": ["VersaSocial", "Referencia", "ContraReferencia", "SolicitacaoReferencia", "CidadaoIdentificacao"]
+        },
+        {
+          "name": "api_cds",
+          "description": "API REST para o app mobile de CDS (Coleta de Dados Simplificada). Autentica agentes comunitários e sincroniza domicílios, indivíduos avulsos, visitas domiciliares, ocorrências e arquivos. Controllers em app/Http/Controllers/ApiCds/, Services em app/Services/ApiCds/. Rotas em apiPassport.php: /cds/auth, /cds/domicilio, /cds/individuos/avulsos, /cds/visitas, /cds/ocorrencias, /cds/arquivos.",
+          "keywords": ["ApiCds", "ApiCdsDomicilio", "ApiCdsIndividuo", "ApiCdsVisita", "ApiCdsOcorrencia", "ApiCdsArquivo", "ApiCdsTransferencia", "ApiCDSAuth"]
+        },
+        {
+          "name": "api_vigilancia",
+          "description": "API REST para o app mobile de Vigilância Epidemiológica (ACE — Agente de Combate a Endemias). Autentica agentes, sincroniza rotas ACE, localidades, imóveis, visitas endêmicas e supervisão. Controller: app/Http/Controllers/API/V1/ApiVigilanciaSaudeController.php, Services: app/Services/Api/. Rotas em apiPassport.php: /vigilancia/autenticacao, /vigilancia/rotas-ace, /vigilancia/localidades, /vigilancia/imoveis, /vigilancia/visitas, /vigilancia/supervisao.",
+          "keywords": ["ApiVigilanciaSaude", "ValidarDadosApiAce", "ApiEsusService", "ApiPrestador"]
+        },
+        {
+          "name": "impressao_relatorios",
+          "description": "Toda impressão de documentos e relatórios usa Jasper Reports via padrão Factory. A classe ReportServiceFactory (app/Factories/ReportServiceFactory.php) decide o modo de geração em dois níveis: (1) env REPORTS_MODE=local|api define o padrão global; (2) o arquivo resources/data/relatorios.csv lista relatórios que SEMPRE usam modo API, independente do REPORTS_MODE. Atualmente 5 relatórios estão no CSV (migrados para API): MarcacaoProtocoloUmaPagina.jrxml, MarcacaoProtocoloDuasPaginas.jrxml, RequisicaoProcedimento.jrxml, ViagensTfdRequisicoes.jrxml, RequisicaoProcedimentoTFD.jrxml. MODO LOCAL (PHPJasperReportService): usa o pacote geekcom/phpjasper, requer Java + JasperStarter no servidor, conecta diretamente ao MySQL via JDBC. Suporta dois data sources: process() para relatórios SQL (passa config de banco) e processJson() para relatórios que recebem dados JSON (salva arquivo temporário em storage/reports_output/data.json). Os 121 templates .jrxml ficam em /reports/ na raiz do projeto. MODO API (ApiReportService): usa o pacote fermaiasoares/document-hub (Versatecnologia). Envia o nome do .jrxml e os parâmetros para a API remota (DOCUMENT_HUB_URL / REPORTS_URL=https://relatorios.versasaude.com.br) autenticada por DOCUMENT_HUB_API_TOKEN / REPORTS_API_KEY. A conexão com o banco de dados do tenant (multi-tenant via TenantManager) é passada como parâmetro para a API remota processar o Jasper. O PDF retornado é salvo localmente e servido ao cliente. Em ambos os modos a interface é ReportServiceInterface (getOutput, getDatabaseConfig, exibeDocumento, process, processJson). Para adicionar um relatório ao modo API basta incluir o nome do .jrxml no resources/data/relatorios.csv. Env vars relevantes: REPORTS_MODE, REPORTS_URL, REPORTS_API_KEY, DOCUMENT_HUB_URL, DOCUMENT_HUB_API_TOKEN.",
+          "keywords": ["ReportServiceFactory", "PHPJasperReportService", "ApiReportService", "ReportServiceInterface", "RelatorioService", "DocumentHub", "jrxml", "ReportsFacade"]
+        }
+      ]
+    }
+  ]
+}

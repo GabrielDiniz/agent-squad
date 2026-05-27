@@ -1,11 +1,10 @@
 import http from "node:http";
 
-const TRIGGER_STATUS = process.env.JIRA_TRIGGER_STATUS ?? "Em Revisão";
+type TriggerMap = Record<string, (issueKey: string) => Promise<void>>;
 
-export function startWebhookServer(
-  port: number,
-  onTrigger: (issueKey: string) => Promise<void>
-): http.Server {
+export function startWebhookServer(port: number, triggers: TriggerMap): http.Server {
+  const triggerLabels = Object.keys(triggers).join(", ");
+
   const server = http.createServer((req, res) => {
     const path = ((req.url ?? "").split("?")[0] ?? "").replace(/\/$/, "");
     console.log(`[webhook] ${req.method} ${req.url}`);
@@ -30,20 +29,26 @@ export function startWebhookServer(
       }
 
       const items: any[] = payload.changelog?.items ?? [];
-      const statusChange = items.find(
-        (i) => {
-          console.log(`[webhook] changelog item: field="${i.field}", from="${i.fromString}", to="${i.toString}"`);
-          return i.field === "status" && i.toString === TRIGGER_STATUS;
-        }
-      );
+      let matchedStatus: string | undefined;
+      let matchedHandler: ((issueKey: string) => Promise<void>) | undefined;
 
-      if (statusChange) {
-        console.log(`[webhook] status "${TRIGGER_STATUS}" detectado para issue ${payload.issue?.key}`);
+      for (const item of items) {
+        const toStatus: string = item.toString ?? "";
+        console.log(`[webhook] changelog item: field="${item.field}", from="${item.fromString}", to="${toStatus}"`);
+        if (item.field === "status" && triggers[toStatus]) {
+          matchedStatus = toStatus;
+          matchedHandler = triggers[toStatus];
+          break;
+        }
+      }
+
+      if (matchedStatus && matchedHandler) {
+        console.log(`[webhook] status "${matchedStatus}" detectado para issue ${payload.issue?.key}`);
         const issueKey: string | undefined = payload.issue?.key;
         if (issueKey) {
           res.writeHead(202).end();
-          onTrigger(issueKey).catch((err) =>
-            console.error(`[reviewer] ${issueKey} erro:`, err)
+          matchedHandler(issueKey).catch((err) =>
+            console.error(`[webhook] ${issueKey} erro:`, err)
           );
           return;
         }
@@ -54,9 +59,7 @@ export function startWebhookServer(
   });
 
   server.listen(port, () =>
-    console.log(
-      `▶ webhook ouvindo em :${port}/webhook  (trigger: "${TRIGGER_STATUS}")`
-    )
+    console.log(`▶ webhook ouvindo em :${port}/webhook  (triggers: "${triggerLabels}")`)
   );
 
   return server;

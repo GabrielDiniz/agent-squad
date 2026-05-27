@@ -1,0 +1,429 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
+import { jiraGetIssue, jiraUpdateIssueField, jiraTransitionToStatus } from "../jira.js";
+import { withRateLimit, interTurnDelay } from "../retry.js";
+import { calculateCostUsd } from "../cost.js";
+
+const client = new Anthropic();
+
+const CODEBASES_CONFIG = process.env.CODEBASES_CONFIG ?? "/app/codebases.json";
+
+// Modelo específico do agente → global → default (sonnet: análise técnica de código)
+const MODEL =
+  process.env.CLAUDE_MODEL_ANALYST ??
+  process.env.CLAUDE_MODEL ??
+  "claude-sonnet-4-6";
+
+const MAX_FILE_READS = 5;
+const DONE_STATUS = process.env.JIRA_ANALYST_DONE_STATUS ?? "Aguardando Desenvolvimento";
+const MAX_OUTPUT_CHARS = 4_000;
+
+interface ModuleEntry {
+  name: string;
+  description: string;
+  keywords?: string[]; // termos de busca para grep/rg
+}
+
+interface CodebaseEntry {
+  name: string;
+  path: string; // absoluto no container
+  description: string;
+  modules?: ModuleEntry[];
+}
+
+function loadCodebases(): CodebaseEntry[] {
+  try {
+    const raw = readFileSync(CODEBASES_CONFIG, "utf-8");
+    const parsed = JSON.parse(raw) as { codebases: CodebaseEntry[] };
+    if (Array.isArray(parsed.codebases) && parsed.codebases.length > 0) {
+      return parsed.codebases;
+    }
+  } catch {
+    // fallthrough
+  }
+  return [
+    {
+      name: "default",
+      path: process.env.CODEBASE_PATH ?? "/workspace",
+      description: "Codebase principal",
+    },
+  ];
+}
+
+const TOOLS: Anthropic.Tool[] = [
+  {
+    name: "jira_get_issue",
+    description: "Busca detalhes de um issue do Jira (título, descrição, critérios de aceite, status).",
+    input_schema: {
+      type: "object" as const,
+      properties: { issue_key: { type: "string" } },
+      required: ["issue_key"],
+    },
+  },
+  {
+    name: "list_codebases",
+    description: "Lista os repositórios disponíveis com nome e descrição. Use para decidir quais são relevantes para a demanda.",
+    input_schema: {
+      type: "object" as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "list_modules",
+    description: "Lista os módulos de um codebase com nome, descrição e keywords de busca. Use após escolher o codebase para identificar os módulos relevantes e os termos a usar no grep/rg.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        codebase: {
+          type: "string",
+          description: "Nome do codebase (obtido via list_codebases)",
+        },
+      },
+      required: ["codebase"],
+    },
+  },
+  {
+    name: "bash_read",
+    description: `Executa comandos read-only na raiz de um codebase. Comandos permitidos: find, grep, rg, ls, cat, head, tail, wc. Use os keywords do módulo (obtidos via list_modules) como termos de busca no grep/rg. Máximo ${MAX_FILE_READS} leituras de arquivo (cat/head/tail) no total entre todos os codebases.`,
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        codebase: {
+          type: "string",
+          description: "Nome do codebase (obtido via list_codebases)",
+        },
+        command: {
+          type: "string",
+          description: "Comando bash read-only. Ex: rg -l 'Marcacao|Regulacao' app/",
+        },
+      },
+      required: ["codebase", "command"],
+    },
+  },
+  {
+    name: "jira_update_field",
+    description: "Preenche o campo de solução técnica do issue com a proposta elaborada (em Markdown).",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        issue_key: { type: "string" },
+        content: { type: "string", description: "Proposta técnica completa em Markdown" },
+      },
+      required: ["issue_key", "content"],
+    },
+  },
+  {
+    name: "jira_transition_issue",
+    description: "Muda o status de um issue do Jira para um novo status.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        issue_key: { type: "string" },
+        status_name: { type: "string" },
+      },
+      required: ["issue_key", "status_name"],
+    },
+    // Ponto 1 de cache: definições de tools são estáticas — cache na última tool
+    cache_control: { type: "ephemeral" } as any,
+  },
+];
+
+// sed -n 'X,Yp' é read-only e permite leitura eficiente de intervalos de linhas
+const ALLOWED_CMD = /^(find|grep|rg|ls|cat|head|tail|wc|sed)\b/;
+
+/**
+ * Extrai o caminho de arquivo do último argumento não-flag do comando (best-effort).
+ * Usado para rastrear acessos por arquivo (melhorias C e D).
+ */
+function extractLastFilePath(cmd: string): string | null {
+  const tokens = cmd.trim().split(/\s+/);
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const t = tokens[i] ?? "";
+    if (!t || t.startsWith("-")) continue;           // flags (-n, -l, …)
+    if (/^['"]/.test(t)) continue;                   // padrões entre aspas ('pattern')
+    if (t.includes("*") || t.includes("{")) continue; // globs
+    if (t.length > 2 && (t.includes("/") || t.includes("."))) return t;
+  }
+  return null;
+}
+
+function execBashRead(
+  codebaseName: string,
+  cmd: string,
+  codebases: CodebaseEntry[],
+  fileReadCount: { n: number },
+  fileAccessCount: Map<string, number>
+): string {
+  const entry = codebases.find((c) => c.name === codebaseName);
+  if (!entry) {
+    const available = codebases.map((c) => c.name).join(", ");
+    return `Erro: codebase "${codebaseName}" não encontrado. Disponíveis: ${available}`;
+  }
+
+  const trimmed = cmd.trim();
+  if (!ALLOWED_CMD.test(trimmed)) {
+    return "Erro: comando não permitido. Use apenas: find, grep, rg, ls, cat, head, tail, wc, sed";
+  }
+
+  const isFileRead = /^(cat|head|tail)\b/.test(trimmed);
+  if (isFileRead) {
+    if (fileReadCount.n >= MAX_FILE_READS) {
+      return `Erro: limite de ${MAX_FILE_READS} leituras de arquivo atingido. Use sed -n 'X,Yp' ou grep/rg para buscas adicionais.`;
+    }
+    fileReadCount.n++;
+  }
+
+  // C + D: rastreia acesso por arquivo
+  const rawPath = extractLastFilePath(trimmed);
+  const absPath = rawPath ? path.resolve(entry.path, rawPath) : null;
+  let prefix = "";
+  if (absPath) {
+    const count = (fileAccessCount.get(absPath) ?? 0) + 1;
+    fileAccessCount.set(absPath, count);
+    if (count === 1) {
+      // D: informa tamanho na primeira leitura — orienta uso de sed -n
+      try {
+        const wc = execSync(`wc -l "${absPath}"`, { encoding: "utf-8", timeout: 3_000 }).trim();
+        const lines = wc.split(/\s+/)[0];
+        prefix = `[Arquivo: ${lines} linhas — prefira sed -n 'X,Yp' para leituras parciais]\n`;
+      } catch { /* ignora se for diretório ou não existir */ }
+    } else if (count >= 3) {
+      // C: alerta sobre leituras repetidas no mesmo arquivo
+      prefix = `⚠ Este arquivo foi acessado ${count}× — consolide as leituras necessárias e prossiga.\n`;
+    }
+  }
+
+  try {
+    const output = execSync(trimmed, {
+      cwd: entry.path,
+      timeout: 10_000,
+      maxBuffer: 1024 * 256,
+      encoding: "utf-8",
+    });
+    const raw = output.length > MAX_OUTPUT_CHARS
+      ? output.slice(0, MAX_OUTPUT_CHARS) + "\n[...truncado]"
+      : output;
+    return prefix ? prefix + raw : raw;
+  } catch (err: any) {
+    const msg = (err.stdout as string | undefined) || err.message || String(err);
+    return `Erro: ${String(msg)}`.slice(0, 500);
+  }
+}
+
+function buildPrompt(issueKey: string): string {
+  return `Você é um analista técnico sênior. Analise a demanda ${issueKey} do Jira e proponha uma solução técnica para a equipe de desenvolvimento.
+
+## Passos obrigatórios
+
+1. **Buscar** os detalhes completos da demanda ${issueKey} no Jira.
+
+2. **Identificar os codebases relevantes**: use list_codebases e selecione os repositórios que se aplicam ao contexto da demanda.
+
+3. **Identificar os módulos relevantes**: para cada codebase selecionado, use list_modules. Cada módulo retorna keywords — use-os como termos de busca no grep/rg para localizar os arquivos certos.
+
+4. **Explorar o código**:
+   - Use rg ou grep com os keywords do módulo para encontrar controllers, models, services e rotas relacionados
+   - Use find e ls para confirmar estrutura quando necessário
+   - **Máximo ${MAX_FILE_READS} leituras completas de arquivo** (cat/head/tail) no total — escolha apenas os mais relevantes
+   - **Disciplina de leitura — siga esta sequência por arquivo:**
+     1. \`grep -n\` ou \`rg -n\` para localizar a linha exata
+     2. \`sed -n 'INICIO,FIMp'\` para ler apenas o trecho relevante (±15 linhas do ponto de interesse)
+     3. Nunca use \`cat\` em arquivos com mais de 100 linhas — prefira \`sed -n\`
+     4. **Cada arquivo deve ser lido no máximo uma vez** — combine todas as informações necessárias em uma única leitura com sed. Ao acessar um arquivo a primeira vez, o sistema informa o número total de linhas.
+
+5. **Elaborar** a proposta técnica contendo:
+   - **Resumo da solução** (2–3 frases)
+   - **Codebases e módulos envolvidos** (com justificativa)
+   - **Arquivos a modificar** (caminho relativo + descrição da mudança)
+   - **Novos arquivos a criar** (se necessário)
+   - **Passos de implementação** (ordenados, concisos)
+   - **Pontos de atenção** (dependências entre módulos/serviços, riscos, testes)
+
+6. **Preencher** o campo de solução técnica do issue ${issueKey} (jira_update_field) com a proposta elaborada.
+
+7. **Transitar** o status do issue para "${DONE_STATUS}".
+
+Seja específico: cite nomes de classes, métodos, rotas e padrões já adotados no projeto.
+Tom: técnico e direto. Escreva em português.
+
+Formate o comentário em **Markdown** (será convertido automaticamente para Jira):
+use ## para seções, **negrito** para destaques, - para listas, 1. para listas numeradas e \`\`\`php para blocos de código.`;
+}
+
+/**
+ * Ponto 3 de cache: rolling cache — antes de cada chamada à API, marca o último
+ * bloco do último user message com cache_control: ephemeral.
+ */
+function applyRollingCache(messages: Anthropic.MessageParam[]): void {
+  // Limpa marcadores de turnos anteriores (índice 0 = prompt inicial — preservar)
+  for (let i = 1; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) delete (block as any).cache_control;
+  }
+
+  // Marca o último bloco do último user message como novo checkpoint de cache
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user") continue;
+    if (typeof msg.content === "string") break;
+    if (!Array.isArray(msg.content) || msg.content.length === 0) break;
+    (msg.content[msg.content.length - 1] as any).cache_control = { type: "ephemeral" };
+    break;
+  }
+}
+
+async function doAnalysis(issueKey: string, rowId: number | null): Promise<void> {
+  const codebases = loadCodebases();
+
+  const messages: Anthropic.MessageParam[] = [
+    {
+      role: "user",
+      // Ponto 2 de cache: prompt inicial fixo por issue
+      content: [{ type: "text", text: buildPrompt(issueKey), cache_control: { type: "ephemeral" } as any }],
+    },
+  ];
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
+  let turns = 0;
+  let finalStatus = "error";
+  const fileReadCount = { n: 0 };
+  const fileAccessCount = new Map<string, number>(); // C+D: acessos por arquivo
+  let lastHeaders: { get(name: string): string | null } | null = null;
+
+  try {
+    while (turns < 25) {
+      if (turns > 0 && lastHeaders) {
+        await interTurnDelay("analyst", lastHeaders);
+      }
+      turns++;
+
+      applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+
+      const { data: response, response: httpResponse } =
+        await client.messages.create({
+          model: MODEL,
+          max_tokens: 4096,
+          tools: TOOLS,
+          messages,
+        }).withResponse();
+
+      lastHeaders = httpResponse.headers;
+
+      const u = response.usage as any;
+      inputTokens += response.usage.input_tokens;
+      outputTokens += response.usage.output_tokens;
+      cacheReadTokens += u.cache_read_input_tokens ?? 0;
+      cacheCreationTokens += u.cache_creation_input_tokens ?? 0;
+
+      // Persiste acumulados após cada turno — garante dados mesmo em caso de interrupção
+      if (rowId !== null) {
+        const usage: TokenUsage = { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
+        const codebaseNames = codebases.map((c) => c.name).join(", ");
+        void dbUpdateSession(rowId, turns, calculateCostUsd(MODEL, usage), usage, codebaseNames);
+      }
+
+      for (const block of response.content) {
+        if (block.type === "text") process.stdout.write(block.text);
+        else if (block.type === "tool_use")
+          console.log(`\n  [tool: ${block.name}(${JSON.stringify(block.input).slice(0, 100)})]`);
+      }
+
+      if (response.stop_reason === "end_turn") {
+        finalStatus = "success";
+        break;
+      }
+
+      if (response.stop_reason === "tool_use") {
+        messages.push({ role: "assistant", content: response.content });
+
+        const results: Anthropic.ToolResultBlockParam[] = [];
+        for (const block of response.content) {
+          if (block.type === "tool_use") {
+            const inp = block.input as Record<string, unknown>;
+            let result: string;
+            try {
+              if (block.name === "jira_get_issue") {
+                result = await jiraGetIssue(inp.issue_key as string);
+              } else if (block.name === "list_codebases") {
+                result = JSON.stringify(
+                  codebases.map((c) => ({ name: c.name, description: c.description })),
+                  null,
+                  2
+                );
+              } else if (block.name === "list_modules") {
+                const entry = codebases.find((c) => c.name === (inp.codebase as string));
+                if (!entry) {
+                  result = `Codebase "${inp.codebase}" não encontrado.`;
+                } else if (!entry.modules?.length) {
+                  result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore diretamente com bash_read.`;
+                } else {
+                  result = JSON.stringify(
+                    entry.modules.map((m) => ({
+                      name: m.name,
+                      description: m.description,
+                      keywords: m.keywords ?? [],
+                    })),
+                    null,
+                    2
+                  );
+                }
+              } else if (block.name === "bash_read") {
+                result = execBashRead(
+                  inp.codebase as string,
+                  inp.command as string,
+                  codebases,
+                  fileReadCount,
+                  fileAccessCount
+                );
+              } else if (block.name === "jira_update_field") {
+                const fieldId = process.env.JIRA_ANALYST_FIELD_ID ?? "";
+                if (!fieldId) {
+                  result = "Erro: JIRA_ANALYST_FIELD_ID não configurado.";
+                } else {
+                  await jiraUpdateIssueField(inp.issue_key as string, fieldId, inp.content as string);
+                  result = "Campo de solução técnica preenchido.";
+                }
+              } else if (block.name === "jira_transition_issue") {
+                result = await jiraTransitionToStatus(inp.issue_key as string, inp.status_name as string);
+              } else {
+                result = `Tool desconhecida: ${block.name}`;
+              }
+            } catch (err) {
+              result = `Erro: ${String(err)}`;
+            }
+            results.push({ type: "tool_result", tool_use_id: block.id, content: result });
+          }
+        }
+        messages.push({ role: "user", content: results });
+      } else {
+        console.log(`\n[analyst] stop_reason inesperado: ${response.stop_reason}`);
+        break;
+      }
+    }
+  } finally {
+    console.log(
+      `\n[analyst] ${issueKey} — status: ${finalStatus} | turnos: ${turns}` +
+        ` | tokens in: ${inputTokens} out: ${outputTokens}` +
+        ` cache_read: ${cacheReadTokens} cache_write: ${cacheCreationTokens}` +
+        ` | file_reads: ${fileReadCount.n}/${MAX_FILE_READS} unique_files: ${fileAccessCount.size}`
+    );
+
+    if (rowId !== null) {
+      await dbFinishSession(rowId, finalStatus);
+    }
+  }
+}
+
+export async function analyzeIssue(issueKey: string): Promise<void> {
+  console.log(`\n[analyst] iniciando análise técnica: ${issueKey}`);
+  const rowId = await dbInsertSession("analyst", issueKey, MODEL);
+  await withRateLimit(() => doAnalysis(issueKey, rowId));
+}

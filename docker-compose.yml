@@ -47,9 +47,12 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_squad}
       MYSQL_USER: ${MYSQL_USER:-agent}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agentpassword}
+      CODEBASES_CONFIG: /app/codebases.json
     volumes:
-      - workspace:/workspace
+      # Configuração de codebases
+      - ./codebases.json:/app/codebases.json:ro
+      # Codebases disponíveis para análise e implementação técnica
+      - /home/versa/projetos/agents-repo/versa-sus:/workspace/versa-saude
 
 volumes:
   mysql_data:
-  workspace:

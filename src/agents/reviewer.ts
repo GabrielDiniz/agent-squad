@@ -1,12 +1,19 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { dbInsertSession, dbFinishSession, type TokenUsage } from "./db.js";
-import { jiraGetIssue, jiraAddComment, jiraTransitionToStatus } from "./jira.js";
-import { withRateLimit } from "./retry.js";
+import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
+import { jiraGetIssue, jiraAddComment, jiraTransitionToStatus } from "../jira.js";
+import { withRateLimit, interTurnDelay } from "../retry.js";
+import { calculateCostUsd } from "../cost.js";
 
 const client = new Anthropic();
 
 const APPROVED_STATUS = process.env.JIRA_APPROVED_STATUS ?? "Aprovado";
 const REJECTED_STATUS = process.env.JIRA_REJECTED_STATUS ?? "Rascunho";
+
+// Modelo específico do agente → global → default (haiku: tarefa textual simples)
+const MODEL =
+  process.env.CLAUDE_MODEL_REVIEWER ??
+  process.env.CLAUDE_MODEL ??
+  "claude-haiku-4-5-20251001";
 
 // 3 tools com schema mínimo — ~300 tokens de overhead (vs ~9k do mcp-atlassian)
 const TOOLS: Anthropic.Tool[] = [
@@ -42,6 +49,8 @@ const TOOLS: Anthropic.Tool[] = [
       },
       required: ["issue_key", "status_name"],
     },
+    // Ponto 1 de cache: definições de tools são estáticas — cache na última tool
+    cache_control: { type: "ephemeral" } as any,
   },
 ];
 
@@ -106,12 +115,45 @@ Intenção clara vale mais do que ausência de formalismo.
      * Exemplo concreto de como reescrever o ponto mais crítico
    - Transite o status para "${REJECTED_STATUS}".
 
-Tom do comentário: colaborativo, não punitivo. O objetivo é ajudar o analista a melhorar a história.`;
+Tom do comentário: colaborativo, não punitivo. O objetivo é ajudar o analista a melhorar a história.
+
+Formate o comentário em **Markdown** (será convertido automaticamente para Jira):
+use ## para seções, **negrito** para destaques, - para listas e \`código\` quando necessário.`;
+}
+
+/**
+ * Ponto 3 de cache: rolling cache — antes de cada chamada à API, marca o último
+ * bloco do último user message com cache_control: ephemeral.
+ * Isso cria um checkpoint na conversa que avança turno a turno, economizando
+ * os tokens do histórico já processado.
+ */
+function applyRollingCache(messages: Anthropic.MessageParam[]): void {
+  // Limpa marcadores de turnos anteriores (índice 0 = prompt inicial — preservar)
+  for (let i = 1; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) delete (block as any).cache_control;
+  }
+
+  // Marca o último bloco do último user message como novo checkpoint de cache
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user") continue;
+    if (typeof msg.content === "string") break;
+    if (!Array.isArray(msg.content) || msg.content.length === 0) break;
+    (msg.content[msg.content.length - 1] as any).cache_control = { type: "ephemeral" };
+    break;
+  }
 }
 
 async function doReview(issueKey: string, rowId: number | null): Promise<void> {
   const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: buildPrompt(issueKey) },
+    {
+      role: "user",
+      // Ponto 2 de cache: prompt inicial é fixo por issue — cache para reutilizar
+      // em retries e qualquer re-execução da mesma issue.
+      content: [{ type: "text", text: buildPrompt(issueKey), cache_control: { type: "ephemeral" } as any }],
+    },
   ];
 
   let inputTokens = 0;
@@ -120,23 +162,38 @@ async function doReview(issueKey: string, rowId: number | null): Promise<void> {
   let cacheCreationTokens = 0;
   let turns = 0;
   let finalStatus = "error";
+  let lastHeaders: { get(name: string): string | null } | null = null;
 
   try {
     while (turns < 10) {
+      if (turns > 0 && lastHeaders) {
+        await interTurnDelay("reviewer", lastHeaders);
+      }
       turns++;
 
-      const response = await client.messages.create({
-        model: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5-20251001",
-        max_tokens: 4096,
-        tools: TOOLS,
-        messages,
-      });
+      applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+
+      const { data: response, response: httpResponse } =
+        await client.messages.create({
+          model: MODEL,
+          max_tokens: 4096,
+          tools: TOOLS,
+          messages,
+        }).withResponse();
+
+      lastHeaders = httpResponse.headers;
 
       const u = response.usage as any;
       inputTokens += response.usage.input_tokens;
       outputTokens += response.usage.output_tokens;
       cacheReadTokens += u.cache_read_input_tokens ?? 0;
       cacheCreationTokens += u.cache_creation_input_tokens ?? 0;
+
+      // Persiste acumulados após cada turno — garante dados mesmo em caso de interrupção
+      if (rowId !== null) {
+        const usage: TokenUsage = { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
+        void dbUpdateSession(rowId, turns, calculateCostUsd(MODEL, usage), usage);
+      }
 
       for (const block of response.content) {
         if (block.type === "text") process.stdout.write(block.text);
@@ -169,8 +226,6 @@ async function doReview(issueKey: string, rowId: number | null): Promise<void> {
       }
     }
   } finally {
-    const usage: TokenUsage = { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
-
     console.log(
       `\n[reviewer] ${issueKey} — status: ${finalStatus} | turnos: ${turns}` +
         ` | tokens in: ${inputTokens} out: ${outputTokens}` +
@@ -178,13 +233,13 @@ async function doReview(issueKey: string, rowId: number | null): Promise<void> {
     );
 
     if (rowId !== null) {
-      await dbFinishSession(rowId, "", finalStatus, turns, 0, usage);
+      await dbFinishSession(rowId, finalStatus);
     }
   }
 }
 
 export async function reviewIssue(issueKey: string): Promise<void> {
   console.log(`\n[reviewer] iniciando avaliação: ${issueKey}`);
-  const rowId = await dbInsertSession(`review:${issueKey}`);
+  const rowId = await dbInsertSession("reviewer", issueKey, MODEL);
   await withRateLimit(() => doReview(issueKey, rowId));
 }

@@ -18,7 +18,9 @@ services:
     volumes:
       - .:/app             # pasta local → /app (hot-reload ao salvar)
       - /app/node_modules  # preserva node_modules instalado na imagem
-      - workspace:/workspace
+      # Codebases disponíveis para análise e implementação técnica
+      - /home/versa/projetos/agents-repo/versa-sus:/workspace/versa-saude
+
     environment:
       NODE_ENV: development
     restart: "no"
