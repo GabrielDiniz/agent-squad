@@ -88,7 +88,7 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "bash_read",
-    description: `Executa comandos read-only na raiz de um codebase. Comandos permitidos: find, grep, rg, ls, cat, head, tail, wc. Use os keywords do módulo (obtidos via list_modules) como termos de busca no grep/rg. Máximo ${MAX_FILE_READS} leituras de arquivo (cat/head/tail) no total entre todos os codebases.`,
+    description: `Executa comandos read-only na raiz de um codebase. Comandos permitidos: find, grep, rg, ls, cat, head, tail, wc, sed. Use os keywords do módulo (obtidos via list_modules) como termos de busca no grep/rg. Máximo ${MAX_FILE_READS} leituras de arquivo (cat/head/tail) no total entre todos os codebases. Sintaxe rg: use -g '*.php' para filtrar por extensão (NÃO --include, que é flag do grep).`,
     input_schema: {
       type: "object" as const,
       properties: {

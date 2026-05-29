@@ -62,11 +62,10 @@ export function buildAuthenticatedUrl(remoteUrl: string): string | null {
     return null;
   }
 
-  // For SSH remotes: reconstruct as HTTPS so we can inject credentials.
-  // This avoids the need for SSH key setup or known_hosts inside containers.
-  const httpsBase = info.isSsh
-    ? `https://${info.host}/${info.owner}/${info.repo}.git`
-    : (remoteUrl.endsWith(".git") ? remoteUrl : remoteUrl + ".git");
+  // SSH remotes use key-based auth — no URL rewriting needed.
+  if (info.isSsh) return null;
+
+  const httpsBase = remoteUrl.endsWith(".git") ? remoteUrl : remoteUrl + ".git";
 
   try {
     const u = new URL(httpsBase);
@@ -89,19 +88,23 @@ export function buildAuthenticatedUrl(remoteUrl: string): string | null {
         break;
       }
       case "bitbucket": {
-        // Reutiliza o mesmo token Atlassian do Jira (JIRA_API_TOKEN)
-        // x-token-auth é o username literal exigido pelo Bitbucket para tokens de API
-        const token = process.env.JIRA_API_TOKEN ?? "";
-        if (!token) return null;
+        // Para git HTTPS no Bitbucket Cloud é necessário um App Password
+        // (criado em bitbucket.org → Configurações → App passwords).
+        // JIRA_API_TOKEN é um Atlassian API Token — funciona para a REST API
+        // mas NÃO para operações git HTTPS no Bitbucket Cloud.
+        const appPassword = process.env.BITBUCKET_APP_PASSWORD ?? "";
+        const apiToken    = process.env.JIRA_API_TOKEN ?? "";
+        const password    = appPassword || apiToken;
+        if (!password) return null;
         u.username = "x-token-auth";
-        u.password = token;
+        u.password = password;
         break;
       }
     }
 
     // Preserve original .git suffix convention
     const result = u.toString();
-    return remoteUrl.endsWith(".git") || info.isSsh ? result : result.slice(0, -4);
+    return remoteUrl.endsWith(".git") ? result : result.slice(0, -4);
   } catch {
     return null;
   }
