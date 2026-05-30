@@ -1,608 +1,248 @@
-# Contexto Tecnico do Projeto
+# Contexto Tecnico (Machine-Oriented)
 
-Este documento consolida o contexto completo para manutencao e evolucao do projeto.
+Documento de referencia tecnica do Agent Squad para manutencao, operacao e evolucao.
+Ordem de leitura: visao do sistema -> arquitetura -> contratos -> dados -> fluxos -> operacao.
 
-## 1. Objetivo
+## 1. Finalidade do sistema
 
-O sistema executa um squad de agentes de IA orientado por mudancas de status no Jira.
+O Agent Squad automatiza o ciclo Jira -> execucao de agentes -> atualizacao de saida tecnica/Git.
 
-Entrada:
-- Evento de webhook Jira.
-
-Saida:
-- Comentarios e transicoes no Jira.
-- Alteracoes de codigo (implementador), commit, push e PR/MR.
-- Logs estruturados de sessao com tokens e custo no MySQL.
-
-## 2. Arquitetura de alto nivel
-
-Componentes principais:
+Principais objetivos:
 
-1. Servidor webhook HTTP
-- Arquivo: src/webhook.ts
-- Endpoint: POST /webhook
-- Detecta mudanca de status em payload.changelog.items
-- Aciona handler mapeado por status
-
-2. Orquestrador de entrada
-- Arquivo: src/index.ts
-- Carrega env, valida obrigatorias, roda migracao DB e registra triggers
-
-3. Agentes
-- src/agents/reviewer.ts
-- src/agents/analyst.ts
-- src/agents/implementor.ts
-
-4. Integracao Jira REST
-- Arquivo: src/jira.ts
-- Leitura de issue, comentario, transicao, update de campo customizado
-- Conversao Markdown -> ADF para escrita no Jira
-
-5. Integracao Git/PR
-- Arquivo: src/git.ts
-- Parse de remotes e autenticacao por provedor
-- Criacao de PR/MR em GitHub, GitLab e Bitbucket
+- Transformar eventos de status do Jira em trabalho assíncrono rastreavel.
+- Garantir processamento seguro em concorrencia (issue e codebase).
+- Preservar consistencia quando eventos novos chegam durante execucao.
+- Manter contratos estaveis para evoluir backend de persistencia.
 
-6. Persistencia e custo
-- src/db.ts para sessoes e migracao
-- src/cost.ts para calculo em USD por modelo/tokens
+## 2. Arquitetura em alto nivel
 
-7. Politica de retry/rate-limit
-- src/retry.ts
-- Retry progressivo para 429 e delay entre turnos com base em headers Anthropic
+Pipeline principal:
 
-## 3. Fluxo do webhook
+`POST /webhook` -> enqueue de job -> claim por worker -> execucao do agente -> persistencia de resultado.
 
-1. Jira envia POST para /webhook.
-2. Servidor valida rota/metodo.
-3. Faz parse do JSON.
-4. Itera changelog.items e procura item.field == status.
-5. Se status de destino existir no mapa de trigger:
-   - calcula event_version
-   - calcula idempotency_key
-   - persiste job em queue_jobs
-   - responde 202 com metadados de rastreio
-6. Se nao houver match, responde 200.
+Caracteristicas arquiteturais:
 
-Observacao:
-- O sistema considera o toString do status no changelog.
-- O webhook nao executa agentes diretamente; apenas enfileira.
+- Webhook em modo enqueue-only.
+- Worker dedicado para execucao assíncrona.
+- Locks SQL com lease para coordenacao concorrente.
+- Idempotencia e supersedencia para consistencia temporal.
+- Abstracao de backend via `QueueBackend` e `LockBackend`.
 
-## 3.1 Fluxo alvo com fila (Fase 12)
+## 3. Componentes e responsabilidades
 
-Arquitetura alvo (planejada para fases 13 a 18):
+### 3.1 Entrada HTTP
 
-1. Webhook recebe evento, valida assinatura e parse.
-2. Webhook calcula chave idempotente e tenta enqueue do job.
-3. Webhook responde 202 apos persistir/encontrar job equivalente.
-4. Worker faz claim transacional de jobs prontos.
-5. Worker adquire lock de issue, valida supersedencia e executa agente.
-6. Worker adquire lock de codebase apenas no trecho critico de escrita/push.
-7. Worker finaliza job em done, failed, cancelled ou stale.
+- Arquivo: `src/webhook.ts`
+- Endpoints:
+  - `POST /webhook`
+  - `GET /health`
+- Responsabilidades:
+  - validar assinatura quando habilitada
+  - parsear evento Jira
+  - mapear status para `agent_type`
+  - enfileirar job com idempotencia
 
-Implementacao atual (fase 15):
+### 3.2 Bootstrap e orquestracao de processo
 
-- Worker em src/worker.ts executa polling configuravel.
-- Claim de job usa transacao com FOR UPDATE SKIP LOCKED.
-- Heartbeat renova lease_until enquanto o job esta em running.
-- Erros transitorios fazem requeue com backoff exponencial e jitter.
-- Erros permanentes ou retries esgotados finalizam em failed (dead-letter logico).
+- Arquivos: `src/index.ts`, `src/bootstrap.ts`
+- Responsabilidades:
+  - validar ambiente
+  - executar migracoes
+  - iniciar servidor webhook
+  - iniciar worker
 
-Fronteiras de responsabilidade:
+### 3.3 Worker runtime
 
-- Webhook: autenticacao, validacao, normalizacao do evento e enqueue.
-- Fila SQL: persistencia, ordenacao, dedupe e observabilidade.
-- Worker: claim, lock, execucao, retry, cancelamento e finalizacao.
+- Arquivo: `src/worker.ts`
+- Responsabilidades:
+  - claim de job pronto
+  - aquisicao, renovacao e liberacao de locks
+  - checkpoints cooperativos
+  - finalizacao (`done`, `failed`, `cancelled`, `stale`)
 
-## 3.2 Contrato de job (alvo)
+### 3.4 Agentes
 
-Payload minimo por job:
+- `src/agents/reviewer.ts`
+- `src/agents/analyst.ts`
+- `src/agents/implementor.ts`
+- Todos aceitam checkpoint cooperativo durante o loop de execucao.
 
-- job_id: identificador unico.
-- issue_key: issue do Jira.
-- agent_type: reviewer | analyst | implementor.
-- trigger_status: status de origem do enqueue.
-- event_version: versao monotonicamente crescente por issue.
-- idempotency_key: hash deterministico do evento.
-- state: queued | running | done | failed | cancelled | stale.
-- attempts: numero de tentativas.
-- max_attempts: limite de retries.
-- next_run_at: elegibilidade para claim.
-- worker_id: worker que esta processando (quando running).
-- error_code e error_message: diagnostico quando failed.
-- created_at, started_at, finished_at: auditoria temporal.
+### 3.5 Persistencia
 
-## 3.3 Maquina de estados do job (alvo)
+- Arquivo: `src/db.ts`
+- Scripts SQL:
+  - `db/init.sql`
+  - `db/migrate_add_tokens.sql`
+  - `db/migrate_queue_workers.sql`
 
-Estados:
+### 3.6 Backend de fila e lock
 
-- queued: aguardando claim.
-- running: em processamento por um worker.
-- done: concluido com sucesso.
-- failed: esgotou tentativas ou erro permanente.
-- cancelled: interrompido por comando/cooperacao.
-- stale: supersedido por evento mais novo da mesma issue.
+- Contratos: `src/queue/backend.ts`
+- Adapter SQL: `src/queue/sql-backend.ts`
+- Factory: `getQueueLockBackend()`
 
-Transicoes permitidas:
+## 4. Contratos de backend
 
-- queued -> running
-- queued -> stale
-- queued -> cancelled
-- running -> done
-- running -> queued (retry)
-- running -> failed
-- running -> cancelled
-- running -> stale
-
-Transicoes proibidas (invariantes de terminal):
-
-- done/failed/cancelled/stale -> qualquer outro estado
-
-## 3.4 Invariantes de concorrencia (alvo)
-
-1. No maximo um job running por issue.
-2. Apenas um lock ativo por codebase em secao critica de escrita.
-3. Claim de job deve ser atomico e impedir dupla execucao.
-4. Toda execucao running tem owner (worker_id) e lease renovavel.
-5. Lock expirado so pode ser retomado via regra de lease.
-
-## 3.5 Idempotencia, dedupe e supersedencia (alvo)
-
-Idempotencia:
-
-- idempotency_key = sha256(issue_key + status_destino + event_version + agent_type).
-- Eventos repetidos com a mesma chave nao criam novo job executavel.
-
-Janela de dedupe:
+### 4.1 QueueBackend
 
-- Dedupe primario por unicidade da chave idempotente.
-- Dedupe secundario por janela temporal de seguranca para eventos sem versao confiavel.
-
-Supersedencia:
-
-- Para uma issue, apenas o maior event_version pode produzir efeito final.
-- Jobs com event_version inferior ao estado atual viram stale.
-- Supersedencia nunca deve rebaixar estado final ja aplicado por evento mais novo.
-
-## 3.6 Contrato de erro (alvo)
-
-Erro transitorio:
-
-- Falha de rede, timeout, rate-limit, indisponibilidade temporaria externa.
-- Acao: retry com backoff exponencial e jitter ate max_attempts.
+Arquivo: `src/queue/backend.ts`
 
-Erro permanente:
-
-- Payload invalido, credencial ausente/negada, violacao de pre-condicao de dominio.
-- Acao: finalizar em failed sem novo retry automatico.
-
-## 3.7 Matriz de concorrencia (alvo)
-
-- Mesmo issue_key + workers distintos: serializar por lock de issue.
-- Codebases diferentes: paralelo permitido.
-- Mesma codebase em escrita/push: serializar por lock de codebase.
-- Leitura sem escrita: paralelo permitido, respeitando limites do worker.
-
-## 4. Mapeamento de status -> agente
-
-Definido em src/index.ts.
-
-Defaults:
-- Revisor: JIRA_TRIGGER_STATUS ou Em Revisao
-- Analista: JIRA_ANALYST_TRIGGER_STATUS ou Em Analise Tecnica
-- Implementador: JIRA_IMPLEMENTOR_TRIGGER_STATUS ou Pronto para Comecar
-
-## 5. Variaveis de ambiente
-
-Obrigatorias na inicializacao:
-- ANTHROPIC_API_KEY
-- JIRA_URL
-- JIRA_USER_EMAIL
-- JIRA_API_TOKEN
-
-Principais grupos:
-
-1. Modelos
-- CLAUDE_MODEL_REVIEWER
-- CLAUDE_MODEL_ANALYST
-- CLAUDE_MODEL_IMPLEMENTOR
-- CLAUDE_MODEL (fallback global)
-
-2. Jira e fluxo
-- JIRA_TRIGGER_STATUS
-- JIRA_APPROVED_STATUS
-- JIRA_REJECTED_STATUS
-- JIRA_ANALYST_TRIGGER_STATUS
-- JIRA_ANALYST_DONE_STATUS
-- JIRA_ANALYST_FIELD_ID
-- JIRA_IMPLEMENTOR_TRIGGER_STATUS
-- JIRA_IMPLEMENTOR_START_STATUS
-- JIRA_IMPLEMENTOR_DONE_STATUS
-- JIRA_IMPLEMENTOR_ERROR_STATUS
-
-3. Git
-- GIT_PROVIDER (github | gitlab | bitbucket)
-- GH_TOKEN
-- GITHUB_API_URL (opcional)
-- GITLAB_TOKEN
-- GITLAB_URL (opcional)
-- BITBUCKET_APP_PASSWORD
-- BITBUCKET_URL (opcional)
-- GIT_USER_NAME
-- GIT_USER_EMAIL
-
-4. Execucao
-- WEBHOOK_PORT
-- CODEBASES_CONFIG
-- AGENT_WORKDIR
-
-5. Banco
-- MYSQL_HOST
-- MYSQL_PORT
-- MYSQL_DATABASE
-- MYSQL_USER
-- MYSQL_PASSWORD
-- MYSQL_ROOT_PASSWORD
-
-6. Rate-limit
-- RATELIMIT_TOKENS_THRESHOLD_PCT
-
-## 6. Agentes em detalhe
-
-### 6.1 Revisor
-
-Arquivo: src/agents/reviewer.ts
-
-Responsabilidades:
-- Buscar issue no Jira
-- Avaliar qualidade da historia por criterios e pesos
-- Comentar aprovacao/reprovacao
-- Transicionar status final
-
-Caracteristicas tecnicas:
-- Modelo default: claude-haiku-4-5-20251001
-- Ferramentas internas: jira_get_issue, jira_add_comment, jira_transition_issue
-- Limite de 10 turnos
-- Persistencia parcial por turno (tokens/custo)
-
-### 6.2 Analista
-
-Arquivo: src/agents/analyst.ts
-
-Responsabilidades:
-- Ler demanda no Jira
-- Explorar codebases/modulos relevantes
-- Produzir proposta tecnica
-- Gravar no campo customizado JIRA_ANALYST_FIELD_ID
-- Transicionar para status de saida
-
-Caracteristicas tecnicas:
-- Modelo default: claude-sonnet-4-6
-- Leitura controlada por comandos read-only
-- Limite MAX_FILE_READS para cat/head/tail
-- Limite de 25 turnos
-
-Ferramentas:
-- jira_get_issue
-- list_codebases
-- list_modules
-- bash_read
-- jira_update_field
-- jira_transition_issue
-
-### 6.3 Implementador
-
-Arquivo: src/agents/implementor.ts
-
-Responsabilidades:
-- Ler issue e spec tecnica
-- Criar branch
-- Modificar arquivos (write_file/patch_file)
-- Executar git/gh
-- Publicar branch e abrir PR/MR
-- Transicionar status final
-
-Caracteristicas tecnicas:
-- Modelo default: claude-sonnet-4-6
-- Limite de 40 turnos
-- Controle de leitura e escrita com validacoes de seguranca
-- Sincroniza master local com origin/master antes de criar branch
-
-Ferramentas:
-- jira_get_issue
-- list_codebases
-- list_modules
-- bash_read
-- write_file
-- patch_file
-- bash_exec
-- create_pull_request
-- jira_transition_issue
-
-Observacao importante:
-- O metodo syncToMaster usa git checkout -f master e git reset --hard origin/master no codebase alvo antes da criacao de branch.
-
-## 7. Persistencia de sessoes e custo
-
-Arquivo: src/db.ts
-
-Ciclo de vida:
-1. dbInsertSession no inicio do agente
-2. dbUpdateSession a cada turno
-3. dbFinishSession no finally
-
-Campos principais em api_sessions:
-- prompt
-- agent_type
-- issue_key
-- model
-- codebase
-- status
-- num_turns
-- total_cost_usd
-- input_tokens
-- output_tokens
-- cache_read_tokens
-- cache_creation_tokens
-- created_at
-- finished_at
+Operacoes:
 
-Views:
-- daily_costs
-- monthly_costs
-- issue_costs
+- `enqueueJob`
+- `claimNextJob`
+- `renewJobLease`
+- `completeJob`
+- `retryJob`
+- `failJob`
+- `getJobState`
+- `isJobSuperseded`
+- `markJobStale`
+- `markJobCancelled`
 
-Scripts SQL:
-- db/init.sql cria tabela e views
-- db/migrate_add_tokens.sql adiciona colunas/views de tokens em instalacoes existentes
+### 4.2 LockBackend
 
-Schema adicional da fila (fase 13):
+Arquivo: `src/queue/backend.ts`
 
-- queue_jobs: persistencia de jobs com estado, attempts, lease e chave idempotente unica.
-- issue_work_state: snapshot por issue com latest_event_version para ordenacao.
-- codebase_locks: lock por codebase com owner, lease_until e heartbeat_at.
+Operacoes:
 
-Views operacionais da fila:
+- `acquireIssueLock`
+- `renewIssueLock`
+- `releaseIssueLock`
+- `acquireCodebaseLock`
+- `renewCodebaseLock`
+- `releaseCodebaseLock`
 
-- queue_jobs_overview: contagem por estado e proxima elegibilidade.
-- queue_jobs_backlog_by_issue: backlog por issue e estado.
+### 4.3 Selecao de implementacao
 
-Operacoes SQL de worker (src/db.ts):
+- Variavel: `QUEUE_BACKEND`
+- Valores aceitos:
+  - `sql` (implementado)
+  - `redis` (reservado)
 
-- dbClaimNextJob
-- dbRenewJobLease
-- dbCompleteJob
-- dbRetryJob
-- dbFailJob
+## 5. Modelo de dados operacional
 
-Operacoes SQL de lock (fase 16):
+### 5.1 Filas e coordenacao
 
-- Issue lock: dbAcquireIssueLock, dbRenewIssueLock, dbReleaseIssueLock
-- Codebase lock: dbAcquireCodebaseLock, dbRenewCodebaseLock, dbReleaseCodebaseLock
+- `queue_jobs`
+  - estados: `queued | running | done | failed | cancelled | stale`
+  - idempotencia: unique em `idempotency_key`
+  - lease: `worker_id`, `claimed_at`, `lease_until`
 
-Politica de locks (implementada):
+- `issue_work_state`
+  - `latest_event_version`
+  - `latest_job_id`
+  - `current_state`
+  - `current_agent_type`
 
-1. Ordem fixa de aquisicao: issue lock -> codebase lock.
-2. Heartbeat periodico renova lease do job e dos locks durante processamento.
-3. Ao lock indisponivel, job retorna para queued com backoff/jitter.
-4. Ordem fixa de liberacao: codebase lock -> issue lock.
-5. Lock expirado pode ser retomado por outro worker (recover por lease).
+- `issue_locks`
+- `codebase_locks`
 
-Supersedencia e cancelamento cooperativo (fase 17):
+### 5.2 Observabilidade
 
-1. Enqueue de evento mais novo marca jobs queued antigos da mesma issue como stale.
-2. Worker executa checkpoints em tres momentos: before-run, between-turns e after-run.
-3. Checkpoint stale: se latest_event_version da issue for maior que o event_version do job, o job vira stale.
-4. Checkpoint cancelled: se state do job for cancelled, o job encerra como cancelled sem concluir transicoes antigas.
-5. Regras impedem regressao: job antigo nao conclui como done se foi supersedido/cancelado durante execucao.
+- `api_sessions`
+- views:
+  - `daily_costs`
+  - `monthly_costs`
+  - `issue_costs`
+  - `queue_jobs_overview`
 
-APIs adicionadas em src/db.ts:
+## 6. Fluxo de processamento
 
-- dbGetIssueWorkState
-- dbGetJobState
-- dbIsJobSuperseded
-- dbMarkJobStale
-- dbMarkJobCancelled
+### 6.1 Fluxo de webhook
 
-## 12.1 Abstracao de backend de fila/lock (fase 18)
+1. Jira envia evento.
+2. Webhook calcula `event_version` e `idempotency_key`.
+3. Webhook enfileira job com `enqueueJob`.
+4. Duplicata retorna dedupe sem novo trabalho executavel.
+5. Evento novo pode marcar jobs antigos como `stale`.
+6. Resposta HTTP: `202` com `jobId` e `deduped`.
 
-Contratos:
+### 6.2 Fluxo de worker
 
-- src/queue/backend.ts define `QueueBackend` e `LockBackend`.
-- src/queue/sql-backend.ts implementa adapter SQL e expoe factory por feature flag.
+1. Worker faz claim (`claimNextJob`).
+2. Aplica ordem fixa de locks:
+   - `issue_lock`
+   - `codebase_lock` (quando implementador)
+3. Executa checkpoints cooperativos:
+   - `before-run`
+   - `between-turns`
+   - `after-run`
+4. Renova leases (job e locks) durante execucao.
+5. Finaliza em `complete`, `retry`, `fail`, `stale` ou `cancelled`.
+6. Libera locks na ordem inversa.
 
-Feature flag:
+## 7. Invariantes de consistencia
 
-- `QUEUE_BACKEND=sql` (padrao atual)
-- `QUEUE_BACKEND=redis` (planejado; ainda nao implementado)
+1. Evento antigo nao pode sobrescrever estado mais novo da mesma issue.
+2. Supersedencia e governada por `isJobSuperseded(issue, version)`.
+3. Job em `cancelled` nao conclui como `done`.
+4. Escrita concorrente na mesma codebase deve ser serializada.
+5. Lock expirado pode ser recuperado com seguranca.
 
-Regra de arquitetura:
+## 8. Modelo de erro e retry
 
-- Worker e webhook dependem do contrato abstrato; nao chamam SQL direto.
+- Falhas transitorias: timeout, rate-limit, rede, indisponibilidade momentanea.
+- Falhas permanentes: contrato invalido, pre-condicao de dominio, erro nao recuperavel.
+- Retry: backoff exponencial com jitter, limitado por `WORKER_RETRY_MAX_MS`.
 
-Conformidade de backend:
+## 9. Configuracao de ambiente
 
-- Testes de worker exercitam o contrato usando mocks de `QueueBackend` e `LockBackend`, garantindo independencia de storage.
+Obrigatorias:
 
-Runbook de migracao sem downtime relevante:
+- `ANTHROPIC_API_KEY`
+- `JIRA_URL`
+- `JIRA_USER_EMAIL`
+- `JIRA_API_TOKEN`
 
-1. Implementar adapter Redis aderente ao contrato.
-2. Rodar testes de conformidade e regressao funcional.
-3. Habilitar canario com `QUEUE_BACKEND=redis` em subset de workers.
-4. Monitorar throughput, retries, stale/cancelled e latencia de claim.
-5. Escalonar cutover gradualmente.
-6. Em erro, rollback por feature flag para `QUEUE_BACKEND=sql`.
+Execucao e fila:
 
-## 8. Calculo de custo
+- `WEBHOOK_PORT`
+- `WORKER_ENABLED`
+- `WORKER_CONCURRENCY`
+- `WORKER_POLL_MS`
+- `WORKER_LEASE_MS`
+- `WORKER_RETRY_BASE_MS`
+- `WORKER_RETRY_MAX_MS`
+- `QUEUE_BACKEND`
 
-Arquivo: src/cost.ts
+Codebases:
 
-Modelos precificados:
-- claude-haiku-4-5-20251001
-- claude-sonnet-4-6
-- claude-opus-4-7
+- `CODEBASES_MODE=url`
+- `CODEBASES_ROOT`
+- `CODEBASES_ALLOWED_HOSTS`
 
-Formula:
-- custo = (input * preco_input + cache_write * preco_cache_write + cache_read * preco_cache_read + output * preco_output) / 1_000_000
+Seguranca do webhook:
 
-Se o modelo nao estiver mapeado:
-- custo retorna 0 e loga warning.
+- `WEBHOOK_SIGNATURE_REQUIRED`
+- `JIRA_WEBHOOK_SIGNATURE_HEADER`
+- `JIRA_WEBHOOK_SECRET`
 
-## 9. Retry e rate-limit
+## 10. Operacao e verificacao
 
-Arquivo: src/retry.ts
+Checklist tecnico de operacao:
 
-withRateLimit:
-- Retry ate 4 vezes para 429
-- Espera incremental de 60s por tentativa
+1. `GET /health` responde corretamente.
+2. Worker habilitado e com conectividade ao MySQL.
+3. Jobs transitam pelos estados esperados na `queue_jobs`.
+4. Locks renovam e liberam sem orphan lock persistente.
+5. Custos e sessoes registrados em `api_sessions` e views.
 
-interTurnDelay:
-- Le headers anthropic-ratelimit-*
-- Espera por reset quando requests/tokens estao proximos do limite
-- Delay minimo de 500ms
+## 11. Evolucao de backend (SQL -> Redis)
 
-## 10. Jira: leitura e escrita ADF
+Diretrizes de migracao:
 
-Arquivo: src/jira.ts
+1. Preservar semantica observavel de `QueueBackend` e `LockBackend`.
+2. Manter regra de negocio fora do adapter de persistencia.
+3. Validar conformidade via testes e regressao funcional.
+4. Liberar com canario e rollback por `QUEUE_BACKEND=sql`.
 
-Leitura:
-- jiraGetIssue coleta summary, description, status, tipo, prioridade, labels, acceptance_criteria (customfield_10016) e technical_spec (campo configurado)
-- adfToText transforma ADF em texto
+## 12. Mapa de arquivos
 
-Escrita:
-- jiraAddComment usa markdownToAdf
-- jiraUpdateIssueField usa markdownToAdf
-
-markdownToAdf suporta:
-- heading
-- bold/italic/code inline
-- links
-- blockquote
-- listas ordenadas e nao ordenadas
-- code fence
-- rule
-- tabela basica
-
-## 11. Git e PR/MR
-
-Arquivo: src/git.ts
-
-Pontos principais:
-- parseRemoteUrl suporta SSH/HTTPS incluindo cenarios Bitbucket Server
-- buildAuthenticatedUrl injeta credenciais para HTTPS conforme provedor
-- createPullRequest abstrai GitHub/GitLab/Bitbucket
-
-GitHub:
-- Usa GH_TOKEN
-- Suporta GITHUB_API_URL para enterprise
-
-GitLab:
-- Usa GITLAB_TOKEN
-- Suporta GITLAB_URL para self-hosted
-
-Bitbucket:
-- Cloud: endpoint /2.0/repositories/.../pullrequests
-- Server/DC: endpoint /rest/api/1.0/projects/.../repos/.../pull-requests
-- Auth para git HTTPS prioriza BITBUCKET_APP_PASSWORD
-
-## 12. Codebases configuraveis
-
-Arquivo: codebases.json
-
-Estrutura:
-- codebases[] com name, repository_url, description e modules[]
-- path e opcional; quando ausente e inferido pelo slug do repository_url em CODEBASES_ROOT
-
-Uso:
-- Analista e implementador consomem list_codebases/list_modules para orientar exploracao do repositorio-alvo.
-- Antes da primeira operacao em uma codebase, o sistema executa clone automatico on-demand quando o repositorio nao existe localmente.
-
-Fallback:
-- Sem entries validas em codebases.json, a lista de codebases fica vazia.
-
-## 13. Infra e execucao
-
-### 13.1 Sem Docker
-
-Comandos:
-- npm install
-- npm run dev
-
-### 13.2 Docker
-
-Arquivos:
-- Dockerfile multi-stage com estagios dev, builder e runtime
-- docker-compose.yml com servico mysql e agent
-- docker-compose.dev.yml para hot-reload
-
-Detalhes relevantes:
-- Runtime com usuario nao-root
-- gh e uvx instalados na imagem
-- known_hosts pre-populado para github/gitlab/bitbucket
-- Codebases sao clonadas para volume interno do container em /workspace/codebases
-
-## 14. Endpoint e contrato de webhook
-
-Endpoint:
-- POST /webhook
-
-Campos usados do payload:
-- issue.key
-- changelog.items[].field
-- changelog.items[].toString
-
-Comportamento de resposta:
-- 404 para rota/metodo diferente
-- 400 para JSON invalido
-- 202 quando status disparador encontrado e handler iniciado
-- 200 quando sem match de status
-
-## 15. Riscos e pontos de atencao
-
-1. Texto default de status
-- Status padronizados no codigo e no .env.example; manter esse alinhamento em futuras alteracoes.
-
-2. Operacoes destrutivas no codebase alvo
-- Implementador sincroniza master com reset hard antes de abrir branch.
-- Em ambientes compartilhados isso pode descartar alteracoes locais.
-
-3. Dependencia de campos Jira
-- acceptance_criteria usa customfield_10016 fixo.
-- technical_spec depende de JIRA_ANALYST_FIELD_ID configurado.
-
-4. Exposicao de contexto
-- codebases.json pode conter contexto extenso de dominio; revisar periodicamente o que deve ser versionado.
-
-## 16. Evolucoes recomendadas
-
-1. Evoluir gerenciamento de clones (prefetch seletivo, prune e cache inteligente).
-2. Expandir testes para casos mais complexos de ADF (nested nodes e tabelas extensas).
-3. Adicionar validacao de assinatura do webhook por provedor (caso use multiplos emissores).
-4. Instrumentar metricas de healthcheck para monitoramento externo.
-5. Criar cache persistente opcional para metadados de repositorios clonados.
-
-## 17. Mapa de arquivos
-
-Raiz:
-- package.json: scripts e dependencias
-- tsconfig.json: compilacao TS
-- Dockerfile: build/dev/runtime
-- docker-compose.yml: mysql + app
-- docker-compose.dev.yml: override hot-reload
-- codebases.json: catalogo de repositorios e modulos
-
-Banco:
-- db/init.sql
-- db/migrate_add_tokens.sql
-
-Aplicacao:
-- src/index.ts
-- src/webhook.ts
-- src/jira.ts
-- src/git.ts
-- src/db.ts
-- src/retry.ts
-- src/cost.ts
-- src/agents/reviewer.ts
-- src/agents/analyst.ts
-- src/agents/implementor.ts
+- Entrada: `src/webhook.ts`
+- Processo: `src/index.ts`, `src/bootstrap.ts`
+- Worker: `src/worker.ts`
+- Contratos/backend: `src/queue/backend.ts`, `src/queue/sql-backend.ts`
+- Persistencia: `src/db.ts`
+- Agentes: `src/agents/reviewer.ts`, `src/agents/analyst.ts`, `src/agents/implementor.ts`
+- SQL: `db/init.sql`, `db/migrate_queue_workers.sql`, `db/migrate_add_tokens.sql`

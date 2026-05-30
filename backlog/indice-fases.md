@@ -51,9 +51,9 @@ Atualizado em: 2026-05-30
 - Status: concluída.
 - Tracking: fases 07 a 11 em [backlog/done/phases](done/phases) com TODOs em [backlog/done/todos](done/todos).
 
-## Nova iniciativa ativa
+## Nova iniciativa
 
 - Objetivo: introduzir fila de trabalho com workers e locks transacionais para evitar interferencia entre agentes.
 - Estratégia: fila e locks via tabelas SQL, com camada de abstração para migração futura para Redis.
-- Status: planejada.
-- Tracking: fases 12 a 18 em [backlog/active/phases](active/phases) com TODOs em [backlog/active/todos](active/todos).
+- Status: concluída.
+- Tracking: fases 12 a 18 em [backlog/done/phases](done/phases) com TODOs em [backlog/done/todos](done/todos).
