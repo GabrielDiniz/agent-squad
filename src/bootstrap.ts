@@ -62,6 +62,11 @@ export function validateEnvironment(): string[] {
     errors.push("QUEUE_BACKEND invalido: use 'sql' (atual) ou 'redis' (futuro).");
   }
 
+  const gitProvider = (process.env.GIT_PROVIDER ?? "github").toLowerCase();
+  if (!["github", "gitlab", "bitbucket", "azure"].includes(gitProvider)) {
+    errors.push("GIT_PROVIDER invalido: use 'github', 'gitlab', 'bitbucket' ou 'azure'.");
+  }
+
   return errors;
 }
 

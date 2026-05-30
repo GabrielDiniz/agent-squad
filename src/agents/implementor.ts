@@ -486,7 +486,7 @@ O restante do arquivo é preservado integralmente.`,
   },
   {
     name: "create_pull_request",
-    description: "Cria uma Pull Request (GitHub/Bitbucket) ou Merge Request (GitLab) no provedor configurado em GIT_PROVIDER. Use após o git push.",
+    description: "Cria uma Pull Request (GitHub/Bitbucket/Azure DevOps) ou Merge Request (GitLab) no provedor configurado em GIT_PROVIDER. Use após o git push.",
     input_schema: {
       type: "object" as const,
       properties: {

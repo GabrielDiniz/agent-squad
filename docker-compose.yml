@@ -50,7 +50,7 @@ services:
       CODEBASES_CONFIG: /app/codebases.json
       CODEBASES_MODE: ${CODEBASES_MODE:-url}
       CODEBASES_ROOT: ${CODEBASES_ROOT:-/workspace/codebases}
-      CODEBASES_ALLOWED_HOSTS: ${CODEBASES_ALLOWED_HOSTS:-github.com,gitlab.com,bitbucket.org}
+      CODEBASES_ALLOWED_HOSTS: ${CODEBASES_ALLOWED_HOSTS:-github.com,gitlab.com,bitbucket.org,dev.azure.com,ssh.dev.azure.com}
       CODEBASE_CLONE_RETRIES: ${CODEBASE_CLONE_RETRIES:-1}
       CODEBASE_CLONE_TIMEOUT_MS: ${CODEBASE_CLONE_TIMEOUT_MS:-300000}
       WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-0}

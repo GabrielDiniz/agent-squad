@@ -67,7 +67,7 @@ cp .env.example .env
 
 - `CODEBASES_MODE=url`
 - `CODEBASES_ROOT=/workspace/codebases`
-- `CODEBASES_ALLOWED_HOSTS=github.com,gitlab.com,bitbucket.org`
+- `CODEBASES_ALLOWED_HOSTS=github.com,gitlab.com,bitbucket.org,dev.azure.com,ssh.dev.azure.com`
 - `WEBHOOK_SIGNATURE_REQUIRED=0|1`
 - `JIRA_WEBHOOK_SIGNATURE_HEADER=x-hub-signature-256`
 - `JIRA_WEBHOOK_SECRET=`
@@ -78,6 +78,14 @@ cp .env.example .env
 - `WORKER_RETRY_BASE_MS=2000`
 - `WORKER_RETRY_MAX_MS=300000`
 - `QUEUE_BACKEND=sql`
+
+5. Configure o provedor Git e credenciais:
+
+- `GIT_PROVIDER=github|gitlab|bitbucket|azure`
+- GitHub: `GH_TOKEN`
+- GitLab: `GITLAB_TOKEN`
+- Bitbucket: `BITBUCKET_APP_PASSWORD`
+- Azure DevOps: `AZURE_DEVOPS_PAT`
 
 ## 5. Como executar
 

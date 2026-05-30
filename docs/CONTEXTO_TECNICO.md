@@ -206,6 +206,14 @@ Execucao e fila:
 - `WORKER_RETRY_MAX_MS`
 - `QUEUE_BACKEND`
 
+Provider Git:
+
+- `GIT_PROVIDER=github|gitlab|bitbucket|azure`
+- `GH_TOKEN` (GitHub)
+- `GITLAB_TOKEN` (GitLab)
+- `BITBUCKET_APP_PASSWORD` (Bitbucket)
+- `AZURE_DEVOPS_PAT` (Azure DevOps)
+
 Codebases:
 
 - `CODEBASES_MODE=url`

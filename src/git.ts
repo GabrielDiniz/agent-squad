@@ -1,11 +1,11 @@
 import { execSync } from "node:child_process";
 
-export type GitProvider = "github" | "gitlab" | "bitbucket";
+export type GitProvider = "github" | "gitlab" | "bitbucket" | "azure";
 
 export function getProvider(): GitProvider {
   const raw = (process.env.GIT_PROVIDER ?? "github").toLowerCase().trim();
-  if (raw === "github" || raw === "gitlab" || raw === "bitbucket") return raw;
-  throw new Error(`GIT_PROVIDER inválido: "${raw}". Use: github | gitlab | bitbucket`);
+  if (raw === "github" || raw === "gitlab" || raw === "bitbucket" || raw === "azure") return raw;
+  throw new Error(`GIT_PROVIDER inválido: "${raw}". Use: github | gitlab | bitbucket | azure`);
 }
 
 // ─── Remote URL parsing ───────────────────────────────────────────────────────
@@ -23,7 +23,11 @@ export function parseRemoteUrl(url: string): RemoteInfo {
   if (sshSimple) {
     const parts = (sshSimple[2] ?? "").split("/");
     const repo = parts.pop() ?? "";
-    return { host: sshSimple[1] ?? "", owner: parts.join("/"), repo, isSsh: true };
+    const host = sshSimple[1] ?? "";
+    let owner = parts.join("/");
+    if (host === "ssh.dev.azure.com") owner = owner.replace(/^v3\//i, "");
+    owner = owner.replace(/\/_git$/i, "");
+    return { host, owner, repo, isSsh: true };
   }
 
   // SSH with scheme: ssh://git@host[:port]/path/repo.git  (Bitbucket Server)
@@ -31,7 +35,11 @@ export function parseRemoteUrl(url: string): RemoteInfo {
   if (sshScheme) {
     const parts = (sshScheme[2] ?? "").replace(/^scm\//, "").split("/");
     const repo = parts.pop() ?? "";
-    return { host: sshScheme[1] ?? "", owner: parts.join("/"), repo, isSsh: true };
+    const host = sshScheme[1] ?? "";
+    let owner = parts.join("/");
+    if (host === "ssh.dev.azure.com") owner = owner.replace(/^v3\//i, "");
+    owner = owner.replace(/\/_git$/i, "");
+    return { host, owner, repo, isSsh: true };
   }
 
   // HTTPS
@@ -43,7 +51,9 @@ export function parseRemoteUrl(url: string): RemoteInfo {
 
   const parts = pathname.split("/");
   const repo = parts.pop() ?? "";
-  return { host: parsed.host, owner: parts.join("/"), repo, isSsh: false };
+  let owner = parts.join("/");
+  owner = owner.replace(/\/_git$/i, "");
+  return { host: parsed.host, owner, repo, isSsh: false };
 }
 
 // ─── Auth URL building ────────────────────────────────────────────────────────
@@ -100,6 +110,14 @@ export function buildAuthenticatedUrl(remoteUrl: string): string | null {
         u.password = password;
         break;
       }
+      case "azure": {
+        const pat = process.env.AZURE_DEVOPS_PAT ?? "";
+        if (!pat) return null;
+        // Azure DevOps HTTPS auth uses basic auth with PAT as password.
+        u.username = "ado";
+        u.password = pat;
+        break;
+      }
     }
 
     // Preserve original .git suffix convention
@@ -138,6 +156,7 @@ export async function createPullRequest(params: CreatePRParams): Promise<string>
     case "github":    return createGithubPR(params, info);
     case "gitlab":    return createGitlabMR(params, info);
     case "bitbucket": return createBitbucketPR(params, info, remoteUrl);
+    case "azure":     return createAzureDevOpsPR(params, remoteUrl);
   }
 }
 
@@ -260,5 +279,86 @@ async function createBitbucketPR(
     (data as any).links?.html?.href ??
     (data as any).links?.self?.[0]?.href ??
     "(URL não disponível)";
+  return `Pull Request criada: ${prUrl}`;
+}
+
+// ─── Azure DevOps ───────────────────────────────────────────────────────────
+
+interface AzureRemoteInfo {
+  organization: string;
+  project: string;
+  repository: string;
+  apiBase: string;
+}
+
+function parseAzureRemote(remoteUrl: string): AzureRemoteInfo {
+  const withoutGit = remoteUrl.replace(/\.git$/, "");
+
+  // HTTPS: https://dev.azure.com/{org}/{project}/_git/{repo}
+  const devAzure = withoutGit.match(/^https?:\/\/dev\.azure\.com\/([^/]+)\/([^/]+)\/_git\/([^/]+)$/i);
+  if (devAzure) {
+    const organization = devAzure[1] ?? "";
+    const project = devAzure[2] ?? "";
+    const repository = devAzure[3] ?? "";
+    return { organization, project, repository, apiBase: `https://dev.azure.com/${organization}` };
+  }
+
+  // HTTPS legacy: https://{org}.visualstudio.com/{project}/_git/{repo}
+  const visualStudio = withoutGit.match(/^https?:\/\/([^/.]+)\.visualstudio\.com\/([^/]+)\/_git\/([^/]+)$/i);
+  if (visualStudio) {
+    const organization = visualStudio[1] ?? "";
+    const project = visualStudio[2] ?? "";
+    const repository = visualStudio[3] ?? "";
+    return { organization, project, repository, apiBase: `https://${organization}.visualstudio.com` };
+  }
+
+  // SSH: git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+  const ssh = withoutGit.match(/^git@ssh\.dev\.azure\.com:v3\/([^/]+)\/([^/]+)\/([^/]+)$/i);
+  if (ssh) {
+    const organization = ssh[1] ?? "";
+    const project = ssh[2] ?? "";
+    const repository = ssh[3] ?? "";
+    return { organization, project, repository, apiBase: `https://dev.azure.com/${organization}` };
+  }
+
+  throw new Error(
+    `Remote Azure DevOps não reconhecido: ${remoteUrl}. Formatos suportados: dev.azure.com, *.visualstudio.com, ssh.dev.azure.com/v3`
+  );
+}
+
+async function createAzureDevOpsPR(params: CreatePRParams, remoteUrl: string): Promise<string> {
+  const pat = process.env.AZURE_DEVOPS_PAT ?? "";
+  if (!pat) throw new Error("AZURE_DEVOPS_PAT não configurado.");
+
+  const { project, repository, apiBase } = parseAzureRemote(remoteUrl);
+  const version = process.env.AZURE_DEVOPS_API_VERSION ?? "7.1";
+  const encodedProject = encodeURIComponent(project);
+  const encodedRepo = encodeURIComponent(repository);
+  const authHeader = `Basic ${Buffer.from(`:${pat}`).toString("base64")}`;
+
+  const res = await fetch(
+    `${apiBase}/${encodedProject}/_apis/git/repositories/${encodedRepo}/pullrequests?api-version=${version}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: authHeader,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: params.title,
+        description: params.body,
+        sourceRefName: `refs/heads/${params.headBranch}`,
+        targetRefName: `refs/heads/${params.baseBranch}`,
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(`Azure DevOps API ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { url?: string; repository?: { webUrl?: string }; pullRequestId?: number };
+  const prUrl =
+    data.repository?.webUrl && data.pullRequestId
+      ? `${data.repository.webUrl}/pullrequest/${data.pullRequestId}`
+      : (data.url ?? "(URL não disponível)");
+
   return `Pull Request criada: ${prUrl}`;
 }

@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-populate SSH known hosts (system-wide) so git SSH ops never prompt for host verification
-RUN ssh-keyscan -H bitbucket.org github.com gitlab.com >> /etc/ssh/ssh_known_hosts 2>/dev/null || true
+RUN ssh-keyscan -H bitbucket.org github.com gitlab.com ssh.dev.azure.com >> /etc/ssh/ssh_known_hosts 2>/dev/null || true
 
 # uv / uvx — necessário para executar o MCP mcp-atlassian
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
@@ -86,7 +86,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-populate SSH known hosts (system-wide) so git SSH ops never prompt for host verification
-RUN ssh-keyscan -H bitbucket.org github.com gitlab.com >> /etc/ssh/ssh_known_hosts 2>/dev/null || true
+RUN ssh-keyscan -H bitbucket.org github.com gitlab.com ssh.dev.azure.com >> /etc/ssh/ssh_known_hosts 2>/dev/null || true
 
 # uv / uvx para o MCP mcp-atlassian
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
