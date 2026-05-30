@@ -7,10 +7,9 @@ import { jiraGetIssue, jiraTransitionToStatus } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { buildAuthenticatedUrl, createPullRequest } from "../git.js";
+import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
 
 const client = new Anthropic();
-
-const CODEBASES_CONFIG = process.env.CODEBASES_CONFIG ?? "/app/codebases.json";
 const MAX_FILE_READS = 10;
 const MAX_OUTPUT_CHARS = 12_000; // aumentado: arquivos PHP/JRXML grandes precisam de mais espaço
 // Modelo específico do agente → global → default (sonnet: geração de código completo)
@@ -22,38 +21,6 @@ const MODEL =
 const START_STATUS = process.env.JIRA_IMPLEMENTOR_START_STATUS ?? "Em andamento";
 const DONE_STATUS  = process.env.JIRA_IMPLEMENTOR_DONE_STATUS  ?? "Code Review";
 const ERROR_STATUS = process.env.JIRA_IMPLEMENTOR_ERROR_STATUS ?? "Pausado";
-
-interface ModuleEntry {
-  name: string;
-  description: string;
-  keywords?: string[];
-}
-
-interface CodebaseEntry {
-  name: string;
-  path: string;
-  description: string;
-  modules?: ModuleEntry[];
-}
-
-function loadCodebases(): CodebaseEntry[] {
-  try {
-    const raw = readFileSync(CODEBASES_CONFIG, "utf-8");
-    const parsed = JSON.parse(raw) as { codebases: CodebaseEntry[] };
-    if (Array.isArray(parsed.codebases) && parsed.codebases.length > 0) {
-      return parsed.codebases;
-    }
-  } catch {
-    // fallthrough
-  }
-  return [
-    {
-      name: "default",
-      path: process.env.CODEBASE_PATH ?? "/workspace",
-      description: "Codebase principal",
-    },
-  ];
-}
 
 // ─── bash_read ────────────────────────────────────────────────────────────────
 
@@ -648,7 +615,7 @@ Seja fiel à especificação técnica. Siga os padrões de código existentes no
 // ─── Agentic loop ─────────────────────────────────────────────────────────────
 
 async function doImplementation(issueKey: string, rowId: number | null): Promise<void> {
-  const codebases = loadCodebases();
+  const codebases = resolveCodebases();
 
   // ── Transição inicial: sinaliza que o agente começou a trabalhar ──────────
   try {
@@ -733,7 +700,12 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
 
               } else if (block.name === "list_codebases") {
                 result = JSON.stringify(
-                  codebases.map((c) => ({ name: c.name, description: c.description })),
+                  codebases.map((c) => ({
+                    name: c.name,
+                    description: c.description,
+                    path: c.path,
+                    repositoryUrl: c.repositoryUrl ?? null,
+                  })),
                   null,
                   2
                 );

@@ -40,7 +40,7 @@ services:
         condition: service_healthy
     env_file: .env
     ports:
-      - "${WEBHOOK_PORT:-3001}:${WEBHOOK_PORT:-3001}"
+      - "${WEBHOOK_PORT:-3000}:${WEBHOOK_PORT:-3000}"
     environment:
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
@@ -48,11 +48,22 @@ services:
       MYSQL_USER: ${MYSQL_USER:-agent}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agentpassword}
       CODEBASES_CONFIG: /app/codebases.json
+      CODEBASES_MODE: ${CODEBASES_MODE:-hybrid}
+      CODEBASES_ROOT: ${CODEBASES_ROOT:-/workspace/codebases}
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-0}
+      JIRA_WEBHOOK_SIGNATURE_HEADER: ${JIRA_WEBHOOK_SIGNATURE_HEADER:-x-hub-signature-256}
+      JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-}
     volumes:
-      # Configuração de codebases
+      # Configuracao estatica opcional de codebases
       - ./codebases.json:/app/codebases.json:ro
-      # Codebases disponíveis para análise e implementação técnica
-      - /home/versa/projetos/agents-repo/versa-sus:/workspace/versa-saude
+      # Raiz unica para descoberta dinamica de repositorios
+      - ${CODEBASES_ROOT_HOST:-/workspaces}:/workspace/codebases
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${WEBHOOK_PORT:-3000}/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   mysql_data:

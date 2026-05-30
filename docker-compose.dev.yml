@@ -14,13 +14,18 @@ services:
       target: dev          # estágio dev do Dockerfile
     command: npm run dev   # garante tsx watch mesmo se imagem cacheada for outra
     ports:
-      - "${WEBHOOK_PORT:-3001}:${WEBHOOK_PORT:-3001}"
+      - "${WEBHOOK_PORT:-3000}:${WEBHOOK_PORT:-3000}"
     volumes:
       - .:/app             # pasta local → /app (hot-reload ao salvar)
       - /app/node_modules  # preserva node_modules instalado na imagem
-      # Codebases disponíveis para análise e implementação técnica
-      - /home/versa/projetos/agents-repo/versa-sus:/workspace/versa-saude
+      # Raiz unica para descoberta dinamica de repositorios
+      - ${CODEBASES_ROOT_HOST:-/workspaces}:/workspace/codebases
 
     environment:
       NODE_ENV: development
+      CODEBASES_MODE: ${CODEBASES_MODE:-hybrid}
+      CODEBASES_ROOT: ${CODEBASES_ROOT:-/workspace/codebases}
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-0}
+      JIRA_WEBHOOK_SIGNATURE_HEADER: ${JIRA_WEBHOOK_SIGNATURE_HEADER:-x-hub-signature-256}
+      JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-}
     restart: "no"

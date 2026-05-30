@@ -22,7 +22,7 @@ async function req(path: string, method = "GET", body?: unknown): Promise<any> {
 // ─── ADF read ────────────────────────────────────────────────────────────────
 
 // Extrai texto plano de Atlassian Document Format (ADF)
-function adfToText(node: any): string {
+export function adfToText(node: any): string {
   if (!node) return "";
   if (node.type === "text") return node.text ?? "";
   if (Array.isArray(node.content)) {
@@ -102,7 +102,7 @@ function makeParagraph(text: string): AdfNode {
  *   > blockquote           → blockquote node
  *   Linhas normais         → paragraph
  */
-function markdownToAdf(markdown: string): AdfNode {
+export function markdownToAdf(markdown: string): AdfNode {
   const lines = markdown.split("\n");
   const content: AdfNode[] = [];
   let i = 0;

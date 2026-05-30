@@ -1,15 +1,13 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
 import { jiraGetIssue, jiraUpdateIssueField, jiraTransitionToStatus } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
+import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
 
 const client = new Anthropic();
-
-const CODEBASES_CONFIG = process.env.CODEBASES_CONFIG ?? "/app/codebases.json";
 
 // Modelo específico do agente → global → default (sonnet: análise técnica de código)
 const MODEL =
@@ -18,40 +16,8 @@ const MODEL =
   "claude-sonnet-4-6";
 
 const MAX_FILE_READS = 5;
-const DONE_STATUS = process.env.JIRA_ANALYST_DONE_STATUS ?? "Aguardando Desenvolvimento";
+const DONE_STATUS = process.env.JIRA_ANALYST_DONE_STATUS ?? "Pronto para Começar";
 const MAX_OUTPUT_CHARS = 4_000;
-
-interface ModuleEntry {
-  name: string;
-  description: string;
-  keywords?: string[]; // termos de busca para grep/rg
-}
-
-interface CodebaseEntry {
-  name: string;
-  path: string; // absoluto no container
-  description: string;
-  modules?: ModuleEntry[];
-}
-
-function loadCodebases(): CodebaseEntry[] {
-  try {
-    const raw = readFileSync(CODEBASES_CONFIG, "utf-8");
-    const parsed = JSON.parse(raw) as { codebases: CodebaseEntry[] };
-    if (Array.isArray(parsed.codebases) && parsed.codebases.length > 0) {
-      return parsed.codebases;
-    }
-  } catch {
-    // fallthrough
-  }
-  return [
-    {
-      name: "default",
-      path: process.env.CODEBASE_PATH ?? "/workspace",
-      description: "Codebase principal",
-    },
-  ];
-}
 
 const TOOLS: Anthropic.Tool[] = [
   {
@@ -278,7 +244,7 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
 }
 
 async function doAnalysis(issueKey: string, rowId: number | null): Promise<void> {
-  const codebases = loadCodebases();
+  const codebases = resolveCodebases();
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -354,7 +320,12 @@ async function doAnalysis(issueKey: string, rowId: number | null): Promise<void>
                 result = await jiraGetIssue(inp.issue_key as string);
               } else if (block.name === "list_codebases") {
                 result = JSON.stringify(
-                  codebases.map((c) => ({ name: c.name, description: c.description })),
+                  codebases.map((c) => ({
+                    name: c.name,
+                    description: c.description,
+                    path: c.path,
+                    repositoryUrl: c.repositoryUrl ?? null,
+                  })),
                   null,
                   2
                 );

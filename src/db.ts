@@ -55,6 +55,17 @@ export async function dbMigrate(): Promise<void> {
   }
 }
 
+export async function dbPing(): Promise<boolean> {
+  const p = getPool();
+  if (!p) return true;
+  try {
+    await p.query("SELECT 1");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 /**
