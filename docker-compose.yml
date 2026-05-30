@@ -48,16 +48,19 @@ services:
       MYSQL_USER: ${MYSQL_USER:-agent}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agentpassword}
       CODEBASES_CONFIG: /app/codebases.json
-      CODEBASES_MODE: ${CODEBASES_MODE:-hybrid}
+      CODEBASES_MODE: ${CODEBASES_MODE:-url}
       CODEBASES_ROOT: ${CODEBASES_ROOT:-/workspace/codebases}
+      CODEBASES_ALLOWED_HOSTS: ${CODEBASES_ALLOWED_HOSTS:-github.com,gitlab.com,bitbucket.org}
+      CODEBASE_CLONE_RETRIES: ${CODEBASE_CLONE_RETRIES:-1}
+      CODEBASE_CLONE_TIMEOUT_MS: ${CODEBASE_CLONE_TIMEOUT_MS:-300000}
       WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-0}
       JIRA_WEBHOOK_SIGNATURE_HEADER: ${JIRA_WEBHOOK_SIGNATURE_HEADER:-x-hub-signature-256}
       JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-}
     volumes:
       # Configuracao estatica opcional de codebases
       - ./codebases.json:/app/codebases.json:ro
-      # Raiz unica para descoberta dinamica de repositorios
-      - ${CODEBASES_ROOT_HOST:-/workspaces}:/workspace/codebases
+      # Cache interno de repositorios clonados automaticamente por URL
+      - codebases_data:/workspace/codebases
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:${WEBHOOK_PORT:-3000}/health || exit 1"]
       interval: 15s
@@ -67,3 +70,4 @@ services:
 
 volumes:
   mysql_data:
+  codebases_data:

@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { parseRemoteUrl } from "./git.js";
 
 export interface ModuleEntry {
   name: string;
@@ -12,10 +13,10 @@ export interface CodebaseEntry {
   path: string;
   description: string;
   modules?: ModuleEntry[];
-  repositoryUrl?: string;
+  repositoryUrl: string;
 }
 
-type CodebasesMode = "static" | "discover" | "hybrid";
+type CodebasesMode = "url";
 
 function getRepoSlugFromUrl(repositoryUrl: string): string | null {
   const raw = repositoryUrl.trim();
@@ -55,11 +56,11 @@ function getRepoSlugFromUrl(repositoryUrl: string): string | null {
 }
 
 function normalizeMode(raw: string | undefined): CodebasesMode {
-  const mode = (raw ?? "hybrid").toLowerCase().trim();
-  if (mode === "static" || mode === "discover" || mode === "hybrid") {
-    return mode;
+  const mode = (raw ?? "url").toLowerCase().trim();
+  if (mode !== "url") {
+    console.warn(`[codebases] CODEBASES_MODE="${mode}" descontinuado; usando modo "url".`);
   }
-  return "hybrid";
+  return "url";
 }
 
 interface RawCodebaseEntry {
@@ -83,6 +84,29 @@ function normalizeStaticEntry(raw: RawCodebaseEntry, root: string): CodebaseEntr
     raw.repoUrl ??
     raw.repo_url ??
     raw.url;
+
+  if (!repositoryUrl?.trim()) {
+    console.warn(`[codebases] entrada "${raw.name}" ignorada: repository_url ausente.`);
+    return null;
+  }
+
+  let host = "";
+  try {
+    host = parseRemoteUrl(repositoryUrl).host.toLowerCase();
+  } catch {
+    console.warn(`[codebases] entrada "${raw.name}" ignorada: repository_url invalida.`);
+    return null;
+  }
+
+  const allowedHosts = (process.env.CODEBASES_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (allowedHosts.length > 0 && !allowedHosts.includes(host)) {
+    console.warn(`[codebases] entrada "${raw.name}" ignorada: host "${host}" fora da whitelist.`);
+    return null;
+  }
 
   let resolvedPath = raw.path?.trim();
   if (!resolvedPath && repositoryUrl) {
@@ -118,97 +142,16 @@ function loadStaticCodebases(configPath: string, root: string): CodebaseEntry[] 
   }
 }
 
-function discoverLocalCodebases(root: string): CodebaseEntry[] {
-  try {
-    if (!existsSync(root) || !statSync(root).isDirectory()) return [];
-  } catch {
-    return [];
-  }
-
-  const result: CodebaseEntry[] = [];
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(root);
-  } catch (err) {
-    console.warn(`[codebases] falha ao listar raiz ${root}: ${String(err)}`);
-    return [];
-  }
-
-  for (const entryName of entries) {
-    const fullPath = path.resolve(root, entryName);
-    try {
-      if (!statSync(fullPath).isDirectory()) continue;
-      if (!existsSync(path.join(fullPath, ".git"))) continue;
-
-      result.push({
-        name: entryName,
-        path: fullPath,
-        description: `Codebase descoberto automaticamente em ${fullPath}`,
-        repositoryUrl: undefined,
-      });
-    } catch {
-      // ignore entry-level errors
-    }
-  }
-
-  return result;
-}
-
-function mergeHybrid(staticEntries: CodebaseEntry[], discoveredEntries: CodebaseEntry[]): CodebaseEntry[] {
-  const byKey = new Map<string, CodebaseEntry>();
-
-  const add = (entry: CodebaseEntry) => {
-    const resolved = path.resolve(entry.path);
-    const key = `${entry.name.toLowerCase()}::${resolved}`;
-    if (!byKey.has(key)) {
-      byKey.set(key, { ...entry, path: resolved });
-      return;
-    }
-
-    const prev = byKey.get(key)!;
-    byKey.set(key, {
-      ...entry,
-      path: resolved,
-      modules: prev.modules?.length ? prev.modules : entry.modules,
-      description: prev.description || entry.description,
-    });
-  };
-
-  for (const entry of staticEntries) add(entry);
-  for (const entry of discoveredEntries) add(entry);
-
-  return [...byKey.values()];
-}
-
 export function resolveCodebases(): CodebaseEntry[] {
-  const mode = normalizeMode(process.env.CODEBASES_MODE);
+  normalizeMode(process.env.CODEBASES_MODE);
   const configPath = process.env.CODEBASES_CONFIG ?? "/app/codebases.json";
-  const root = process.env.CODEBASES_ROOT ?? process.env.CODEBASE_PATH ?? "/workspace";
+  const root = process.env.CODEBASES_ROOT ?? process.env.CODEBASE_PATH ?? "/workspace/codebases";
 
   const staticEntries = loadStaticCodebases(configPath, root);
-  const discoveredEntries = discoverLocalCodebases(root);
-
-  let codebases: CodebaseEntry[];
-  if (mode === "static") {
-    codebases = staticEntries;
-  } else if (mode === "discover") {
-    codebases = discoveredEntries;
-  } else {
-    codebases = mergeHybrid(staticEntries, discoveredEntries);
-  }
-
-  if (codebases.length === 0) {
-    codebases = [
-      {
-        name: "default",
-        path: path.resolve(root),
-        description: "Codebase principal (fallback)",
-      },
-    ];
-  }
+  const codebases = staticEntries;
 
   console.log(
-    `[codebases] mode=${mode} static=${staticEntries.length} discovered=${discoveredEntries.length} total=${codebases.length}`
+    `[codebases] mode=url total=${codebases.length} root=${path.resolve(root)}`
   );
   return codebases;
 }

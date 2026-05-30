@@ -1,11 +1,13 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
 import { jiraGetIssue, jiraUpdateIssueField, jiraTransitionToStatus } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
+import { ensureCodebaseCloned } from "../repository.js";
 
 const client = new Anthropic();
 
@@ -97,6 +99,10 @@ const TOOLS: Anthropic.Tool[] = [
     cache_control: { type: "ephemeral" } as any,
   },
 ];
+
+export interface AgentRunOptions {
+  checkpoint?: () => Promise<void>;
+}
 
 // sed -n 'X,Yp' é read-only e permite leitura eficiente de intervalos de linhas
 const ALLOWED_CMD = /^(find|grep|rg|ls|cat|head|tail|wc|sed)\b/;
@@ -243,8 +249,17 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
   }
 }
 
-async function doAnalysis(issueKey: string, rowId: number | null): Promise<void> {
+async function doAnalysis(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
   const codebases = resolveCodebases();
+  async function resolveCodebaseOrError(codebaseName: string): Promise<CodebaseEntry> {
+    const entry = codebases.find((c) => c.name === codebaseName);
+    if (!entry) {
+      const available = codebases.map((c) => c.name).join(", ");
+      throw new Error(`Codebase "${codebaseName}" não encontrado. Disponíveis: ${available}`);
+    }
+    await ensureCodebaseCloned(entry);
+    return entry;
+  }
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -266,6 +281,9 @@ async function doAnalysis(issueKey: string, rowId: number | null): Promise<void>
 
   try {
     while (turns < 25) {
+      if (options?.checkpoint) {
+        await options.checkpoint();
+      }
       if (turns > 0 && lastHeaders) {
         await interTurnDelay("analyst", lastHeaders);
       }
@@ -325,15 +343,14 @@ async function doAnalysis(issueKey: string, rowId: number | null): Promise<void>
                     description: c.description,
                     path: c.path,
                     repositoryUrl: c.repositoryUrl ?? null,
+                    localReady: existsSync(path.join(c.path, ".git")),
                   })),
                   null,
                   2
                 );
               } else if (block.name === "list_modules") {
-                const entry = codebases.find((c) => c.name === (inp.codebase as string));
-                if (!entry) {
-                  result = `Codebase "${inp.codebase}" não encontrado.`;
-                } else if (!entry.modules?.length) {
+                const entry = await resolveCodebaseOrError(inp.codebase as string);
+                if (!entry.modules?.length) {
                   result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore diretamente com bash_read.`;
                 } else {
                   result = JSON.stringify(
@@ -347,6 +364,7 @@ async function doAnalysis(issueKey: string, rowId: number | null): Promise<void>
                   );
                 }
               } else if (block.name === "bash_read") {
+                await resolveCodebaseOrError(inp.codebase as string);
                 result = execBashRead(
                   inp.codebase as string,
                   inp.command as string,
@@ -393,8 +411,8 @@ async function doAnalysis(issueKey: string, rowId: number | null): Promise<void>
   }
 }
 
-export async function analyzeIssue(issueKey: string): Promise<void> {
+export async function analyzeIssue(issueKey: string, options?: AgentRunOptions): Promise<void> {
   console.log(`\n[analyst] iniciando análise técnica: ${issueKey}`);
   const rowId = await dbInsertSession("analyst", issueKey, MODEL);
-  await withRateLimit(() => doAnalysis(issueKey, rowId));
+  await withRateLimit(() => doAnalysis(issueKey, rowId, options));
 }

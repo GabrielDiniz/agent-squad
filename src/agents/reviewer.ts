@@ -54,6 +54,10 @@ const TOOLS: Anthropic.Tool[] = [
   },
 ];
 
+export interface AgentRunOptions {
+  checkpoint?: () => Promise<void>;
+}
+
 async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
   try {
     if (name === "jira_get_issue") return await jiraGetIssue(input.issue_key as string);
@@ -146,7 +150,7 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
   }
 }
 
-async function doReview(issueKey: string, rowId: number | null): Promise<void> {
+async function doReview(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
@@ -166,6 +170,9 @@ async function doReview(issueKey: string, rowId: number | null): Promise<void> {
 
   try {
     while (turns < 10) {
+      if (options?.checkpoint) {
+        await options.checkpoint();
+      }
       if (turns > 0 && lastHeaders) {
         await interTurnDelay("reviewer", lastHeaders);
       }
@@ -238,8 +245,8 @@ async function doReview(issueKey: string, rowId: number | null): Promise<void> {
   }
 }
 
-export async function reviewIssue(issueKey: string): Promise<void> {
+export async function reviewIssue(issueKey: string, options?: AgentRunOptions): Promise<void> {
   console.log(`\n[reviewer] iniciando avaliação: ${issueKey}`);
   const rowId = await dbInsertSession("reviewer", issueKey, MODEL);
-  await withRateLimit(() => doReview(issueKey, rowId));
+  await withRateLimit(() => doReview(issueKey, rowId, options));
 }

@@ -1,8 +1,55 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { dbPing } from "./db.js";
+import { dbPing, type AgentType } from "./db.js";
+import type { QueueBackend } from "./queue/backend.js";
+import { getQueueLockBackend } from "./queue/sql-backend.js";
 
-type TriggerMap = Record<string, (issueKey: string) => Promise<void>>;
+type TriggerMap = Record<string, AgentType>;
+
+function buildEventVersion(payload: any): number {
+  const changelogId = payload?.changelog?.id;
+  if (changelogId !== undefined) {
+    const n = Number(changelogId);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  }
+
+  const created = payload?.timestamp ?? payload?.changelog?.created;
+  if (typeof created === "number" && Number.isFinite(created) && created >= 0) {
+    return Math.floor(created);
+  }
+  if (typeof created === "string" && created.trim()) {
+    const ms = Date.parse(created);
+    if (Number.isFinite(ms) && ms >= 0) return ms;
+  }
+
+  return Date.now();
+}
+
+function buildIdempotencyKey(issueKey: string, toStatus: string, eventVersion: number, agentType: AgentType): string {
+  const raw = `${issueKey}|${toStatus}|${eventVersion}|${agentType}`;
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+async function enqueueJobFromWebhook(params: {
+  payload: any;
+  issueKey: string;
+  matchedStatus: string;
+  matchedAgentType: AgentType;
+  queue: QueueBackend;
+}): Promise<{ jobId: number; deduped: boolean }> {
+  const { payload, issueKey, matchedStatus, matchedAgentType, queue } = params;
+  const eventVersion = buildEventVersion(payload);
+  const idempotencyKey = buildIdempotencyKey(issueKey, matchedStatus, eventVersion, matchedAgentType);
+
+  return queue.enqueueJob({
+    issueKey,
+    agentType: matchedAgentType,
+    triggerStatus: matchedStatus,
+    eventVersion,
+    idempotencyKey,
+    payload,
+  });
+}
 
 function getHeader(req: http.IncomingMessage, name: string): string | null {
   const value = req.headers[name.toLowerCase()];
@@ -32,6 +79,8 @@ export function startWebhookServer(port: number, triggers: TriggerMap): http.Ser
   const signatureSecret = process.env.JIRA_WEBHOOK_SECRET ?? "";
   const signatureHeader = (process.env.JIRA_WEBHOOK_SIGNATURE_HEADER ?? "x-hub-signature-256").toLowerCase();
   const mustValidateSignature = signatureRequired || Boolean(signatureSecret);
+
+  const queue = getQueueLockBackend();
 
   const server = http.createServer((req, res) => {
     const path = ((req.url ?? "").split("?")[0] ?? "").replace(/\/$/, "");
@@ -83,26 +132,53 @@ export function startWebhookServer(port: number, triggers: TriggerMap): http.Ser
 
       const items: any[] = payload.changelog?.items ?? [];
       let matchedStatus: string | undefined;
-      let matchedHandler: ((issueKey: string) => Promise<void>) | undefined;
+      let matchedAgentType: AgentType | undefined;
 
       for (const item of items) {
         const toStatus: string = item.toString ?? "";
         console.log(`[webhook] changelog item: field="${item.field}", from="${item.fromString}", to="${toStatus}"`);
         if (item.field === "status" && triggers[toStatus]) {
           matchedStatus = toStatus;
-          matchedHandler = triggers[toStatus];
+          matchedAgentType = triggers[toStatus];
           break;
         }
       }
 
-      if (matchedStatus && matchedHandler) {
+      if (matchedStatus && matchedAgentType) {
         console.log(`[webhook] status "${matchedStatus}" detectado para issue ${payload.issue?.key}`);
         const issueKey: string | undefined = payload.issue?.key;
         if (issueKey) {
-          res.writeHead(202).end();
-          matchedHandler(issueKey).catch((err) =>
-            console.error(`[webhook] ${issueKey} erro:`, err)
-          );
+          void (async () => {
+            try {
+              const { jobId, deduped } = await enqueueJobFromWebhook({
+                payload,
+                issueKey,
+                matchedStatus,
+                matchedAgentType,
+                queue,
+              });
+
+              console.log(
+                `[webhook] enqueue issue=${issueKey} status=${matchedStatus} agent=${matchedAgentType} jobId=${jobId} deduped=${deduped}`
+              );
+
+              res
+                .writeHead(202, { "Content-Type": "application/json" })
+                .end(
+                  JSON.stringify({
+                    accepted: true,
+                    issueKey,
+                    status: matchedStatus,
+                    agentType: matchedAgentType,
+                    jobId,
+                    deduped,
+                  })
+                );
+            } catch (err) {
+              console.error("[webhook] erro ao enfileirar job:", err);
+              res.writeHead(503).end("queue unavailable");
+            }
+          })();
           return;
         }
       }

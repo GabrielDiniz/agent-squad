@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { execSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
 import { jiraGetIssue, jiraTransitionToStatus } from "../jira.js";
@@ -8,6 +8,7 @@ import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { buildAuthenticatedUrl, createPullRequest } from "../git.js";
 import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
+import { ensureCodebaseCloned } from "../repository.js";
 
 const client = new Anthropic();
 const MAX_FILE_READS = 10;
@@ -21,6 +22,10 @@ const MODEL =
 const START_STATUS = process.env.JIRA_IMPLEMENTOR_START_STATUS ?? "Em andamento";
 const DONE_STATUS  = process.env.JIRA_IMPLEMENTOR_DONE_STATUS  ?? "Code Review";
 const ERROR_STATUS = process.env.JIRA_IMPLEMENTOR_ERROR_STATUS ?? "Pausado";
+
+export interface AgentRunOptions {
+  checkpoint?: () => Promise<void>;
+}
 
 // ─── bash_read ────────────────────────────────────────────────────────────────
 
@@ -614,8 +619,17 @@ Seja fiel à especificação técnica. Siga os padrões de código existentes no
 
 // ─── Agentic loop ─────────────────────────────────────────────────────────────
 
-async function doImplementation(issueKey: string, rowId: number | null): Promise<void> {
+async function doImplementation(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
   const codebases = resolveCodebases();
+
+  async function resolveCodebaseOrError(codebaseName: string): Promise<CodebaseEntry> {
+    const entry = codebases.find((c) => c.name === codebaseName);
+    if (!entry) {
+      throw new Error(`Codebase "${codebaseName}" não encontrado. Disponíveis: ${codebases.map((c) => c.name).join(", ")}`);
+    }
+    await ensureCodebaseCloned(entry);
+    return entry;
+  }
 
   // ── Transição inicial: sinaliza que o agente começou a trabalhar ──────────
   try {
@@ -645,6 +659,9 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
 
   try {
     while (turns < 40) {
+      if (options?.checkpoint) {
+        await options.checkpoint();
+      }
       if (turns > 0 && lastHeaders) {
         await interTurnDelay("implementor", lastHeaders);
       }
@@ -705,16 +722,15 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                     description: c.description,
                     path: c.path,
                     repositoryUrl: c.repositoryUrl ?? null,
+                    localReady: existsSync(path.join(c.path, ".git")),
                   })),
                   null,
                   2
                 );
 
               } else if (block.name === "list_modules") {
-                const entry = codebases.find((c) => c.name === (inp.codebase as string));
-                if (!entry) {
-                  result = `Codebase "${inp.codebase}" não encontrado.`;
-                } else if (!entry.modules?.length) {
+                const entry = await resolveCodebaseOrError(inp.codebase as string);
+                if (!entry.modules?.length) {
                   result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore com bash_read.`;
                 } else {
                   result = JSON.stringify(
@@ -729,6 +745,7 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                 }
 
               } else if (block.name === "bash_read") {
+                await resolveCodebaseOrError(inp.codebase as string);
                 result = execBashRead(
                   inp.codebase as string,
                   inp.command as string,
@@ -738,6 +755,7 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                 );
 
               } else if (block.name === "write_file") {
+                await resolveCodebaseOrError(inp.codebase as string);
                 result = execWriteFile(
                   inp.codebase as string,
                   inp.relative_path as string,
@@ -746,6 +764,7 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                 );
 
               } else if (block.name === "patch_file") {
+                await resolveCodebaseOrError(inp.codebase as string);
                 result = execPatchFile(
                   inp.codebase as string,
                   inp.relative_path as string,
@@ -756,6 +775,7 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                 );
 
               } else if (block.name === "bash_exec") {
+                await resolveCodebaseOrError(inp.codebase as string);
                 result = execBashExec(
                   inp.codebase as string,
                   inp.command as string,
@@ -763,18 +783,14 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
                 );
 
               } else if (block.name === "create_pull_request") {
-                const entry = codebases.find((c) => c.name === (inp.codebase as string));
-                if (!entry) {
-                  result = `Codebase "${inp.codebase}" não encontrado.`;
-                } else {
-                  result = await createPullRequest({
-                    cwd: entry.path,
-                    title: inp.title as string,
-                    body: inp.body as string,
-                    headBranch: inp.head_branch as string,
-                    baseBranch: inp.base_branch as string,
-                  });
-                }
+                const entry = await resolveCodebaseOrError(inp.codebase as string);
+                result = await createPullRequest({
+                  cwd: entry.path,
+                  title: inp.title as string,
+                  body: inp.body as string,
+                  headBranch: inp.head_branch as string,
+                  baseBranch: inp.base_branch as string,
+                });
 
               } else if (block.name === "jira_transition_issue") {
                 result = await jiraTransitionToStatus(
@@ -821,8 +837,8 @@ async function doImplementation(issueKey: string, rowId: number | null): Promise
   }
 }
 
-export async function implementIssue(issueKey: string): Promise<void> {
+export async function implementIssue(issueKey: string, options?: AgentRunOptions): Promise<void> {
   console.log(`\n[implementor] iniciando implementação: ${issueKey}`);
   const rowId = await dbInsertSession("implementor", issueKey, MODEL);
-  await withRateLimit(() => doImplementation(issueKey, rowId));
+  await withRateLimit(() => doImplementation(issueKey, rowId, options));
 }

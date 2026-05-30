@@ -2,8 +2,7 @@
   "codebases": [
     {
       "name": "versa-saude",
-      "path": "/workspace/versa-saude",
-      "repository_url": "https://git.example.com/org/versa-saude.git",
+      "repository_url": "https://gitlab.com/org/versa-saude.git",
       "description": "Aplicação web monolítica em Laravel + MySQL, padrão MVC. Estrutura flat: Controllers em app/Http/Controllers, Models em app/Models, Services em app/Services, Repositories em app/Repositories. Módulos identificados por prefixo de nome de classe, sem subpastas dedicadas (exceto Upa, Agenda, VersaSocial e Api).",
       "modules": [
         {

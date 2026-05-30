@@ -47,6 +47,21 @@ export function validateEnvironment(): string[] {
     errors.push("JIRA_WEBHOOK_SECRET obrigatoria quando WEBHOOK_SIGNATURE_REQUIRED=1.");
   }
 
+  const mode = (process.env.CODEBASES_MODE ?? "url").toLowerCase();
+  if (mode !== "url") {
+    errors.push("CODEBASES_MODE invalido: use apenas 'url'.");
+  }
+
+  const codebasesRoot = process.env.CODEBASES_ROOT ?? "";
+  if (!codebasesRoot.trim()) {
+    errors.push("CODEBASES_ROOT obrigatoria para armazenamento local dos clones.");
+  }
+
+  const queueBackend = (process.env.QUEUE_BACKEND ?? "sql").toLowerCase();
+  if (queueBackend !== "sql" && queueBackend !== "redis") {
+    errors.push("QUEUE_BACKEND invalido: use 'sql' (atual) ou 'redis' (futuro).");
+  }
+
   return errors;
 }
 

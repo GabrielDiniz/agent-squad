@@ -58,12 +58,130 @@ Componentes principais:
 3. Faz parse do JSON.
 4. Itera changelog.items e procura item.field == status.
 5. Se status de destino existir no mapa de trigger:
-   - responde 202 imediatamente
-   - executa handler de forma assincrona
+   - calcula event_version
+   - calcula idempotency_key
+   - persiste job em queue_jobs
+   - responde 202 com metadados de rastreio
 6. Se nao houver match, responde 200.
 
 Observacao:
 - O sistema considera o toString do status no changelog.
+- O webhook nao executa agentes diretamente; apenas enfileira.
+
+## 3.1 Fluxo alvo com fila (Fase 12)
+
+Arquitetura alvo (planejada para fases 13 a 18):
+
+1. Webhook recebe evento, valida assinatura e parse.
+2. Webhook calcula chave idempotente e tenta enqueue do job.
+3. Webhook responde 202 apos persistir/encontrar job equivalente.
+4. Worker faz claim transacional de jobs prontos.
+5. Worker adquire lock de issue, valida supersedencia e executa agente.
+6. Worker adquire lock de codebase apenas no trecho critico de escrita/push.
+7. Worker finaliza job em done, failed, cancelled ou stale.
+
+Implementacao atual (fase 15):
+
+- Worker em src/worker.ts executa polling configuravel.
+- Claim de job usa transacao com FOR UPDATE SKIP LOCKED.
+- Heartbeat renova lease_until enquanto o job esta em running.
+- Erros transitorios fazem requeue com backoff exponencial e jitter.
+- Erros permanentes ou retries esgotados finalizam em failed (dead-letter logico).
+
+Fronteiras de responsabilidade:
+
+- Webhook: autenticacao, validacao, normalizacao do evento e enqueue.
+- Fila SQL: persistencia, ordenacao, dedupe e observabilidade.
+- Worker: claim, lock, execucao, retry, cancelamento e finalizacao.
+
+## 3.2 Contrato de job (alvo)
+
+Payload minimo por job:
+
+- job_id: identificador unico.
+- issue_key: issue do Jira.
+- agent_type: reviewer | analyst | implementor.
+- trigger_status: status de origem do enqueue.
+- event_version: versao monotonicamente crescente por issue.
+- idempotency_key: hash deterministico do evento.
+- state: queued | running | done | failed | cancelled | stale.
+- attempts: numero de tentativas.
+- max_attempts: limite de retries.
+- next_run_at: elegibilidade para claim.
+- worker_id: worker que esta processando (quando running).
+- error_code e error_message: diagnostico quando failed.
+- created_at, started_at, finished_at: auditoria temporal.
+
+## 3.3 Maquina de estados do job (alvo)
+
+Estados:
+
+- queued: aguardando claim.
+- running: em processamento por um worker.
+- done: concluido com sucesso.
+- failed: esgotou tentativas ou erro permanente.
+- cancelled: interrompido por comando/cooperacao.
+- stale: supersedido por evento mais novo da mesma issue.
+
+Transicoes permitidas:
+
+- queued -> running
+- queued -> stale
+- queued -> cancelled
+- running -> done
+- running -> queued (retry)
+- running -> failed
+- running -> cancelled
+- running -> stale
+
+Transicoes proibidas (invariantes de terminal):
+
+- done/failed/cancelled/stale -> qualquer outro estado
+
+## 3.4 Invariantes de concorrencia (alvo)
+
+1. No maximo um job running por issue.
+2. Apenas um lock ativo por codebase em secao critica de escrita.
+3. Claim de job deve ser atomico e impedir dupla execucao.
+4. Toda execucao running tem owner (worker_id) e lease renovavel.
+5. Lock expirado so pode ser retomado via regra de lease.
+
+## 3.5 Idempotencia, dedupe e supersedencia (alvo)
+
+Idempotencia:
+
+- idempotency_key = sha256(issue_key + status_destino + event_version + agent_type).
+- Eventos repetidos com a mesma chave nao criam novo job executavel.
+
+Janela de dedupe:
+
+- Dedupe primario por unicidade da chave idempotente.
+- Dedupe secundario por janela temporal de seguranca para eventos sem versao confiavel.
+
+Supersedencia:
+
+- Para uma issue, apenas o maior event_version pode produzir efeito final.
+- Jobs com event_version inferior ao estado atual viram stale.
+- Supersedencia nunca deve rebaixar estado final ja aplicado por evento mais novo.
+
+## 3.6 Contrato de erro (alvo)
+
+Erro transitorio:
+
+- Falha de rede, timeout, rate-limit, indisponibilidade temporaria externa.
+- Acao: retry com backoff exponencial e jitter ate max_attempts.
+
+Erro permanente:
+
+- Payload invalido, credencial ausente/negada, violacao de pre-condicao de dominio.
+- Acao: finalizar em failed sem novo retry automatico.
+
+## 3.7 Matriz de concorrencia (alvo)
+
+- Mesmo issue_key + workers distintos: serializar por lock de issue.
+- Codebases diferentes: paralelo permitido.
+- Mesma codebase em escrita/push: serializar por lock de codebase.
+- Leitura sem escrita: paralelo permitido, respeitando limites do worker.
 
 ## 4. Mapeamento de status -> agente
 
@@ -238,6 +356,83 @@ Scripts SQL:
 - db/init.sql cria tabela e views
 - db/migrate_add_tokens.sql adiciona colunas/views de tokens em instalacoes existentes
 
+Schema adicional da fila (fase 13):
+
+- queue_jobs: persistencia de jobs com estado, attempts, lease e chave idempotente unica.
+- issue_work_state: snapshot por issue com latest_event_version para ordenacao.
+- codebase_locks: lock por codebase com owner, lease_until e heartbeat_at.
+
+Views operacionais da fila:
+
+- queue_jobs_overview: contagem por estado e proxima elegibilidade.
+- queue_jobs_backlog_by_issue: backlog por issue e estado.
+
+Operacoes SQL de worker (src/db.ts):
+
+- dbClaimNextJob
+- dbRenewJobLease
+- dbCompleteJob
+- dbRetryJob
+- dbFailJob
+
+Operacoes SQL de lock (fase 16):
+
+- Issue lock: dbAcquireIssueLock, dbRenewIssueLock, dbReleaseIssueLock
+- Codebase lock: dbAcquireCodebaseLock, dbRenewCodebaseLock, dbReleaseCodebaseLock
+
+Politica de locks (implementada):
+
+1. Ordem fixa de aquisicao: issue lock -> codebase lock.
+2. Heartbeat periodico renova lease do job e dos locks durante processamento.
+3. Ao lock indisponivel, job retorna para queued com backoff/jitter.
+4. Ordem fixa de liberacao: codebase lock -> issue lock.
+5. Lock expirado pode ser retomado por outro worker (recover por lease).
+
+Supersedencia e cancelamento cooperativo (fase 17):
+
+1. Enqueue de evento mais novo marca jobs queued antigos da mesma issue como stale.
+2. Worker executa checkpoints em tres momentos: before-run, between-turns e after-run.
+3. Checkpoint stale: se latest_event_version da issue for maior que o event_version do job, o job vira stale.
+4. Checkpoint cancelled: se state do job for cancelled, o job encerra como cancelled sem concluir transicoes antigas.
+5. Regras impedem regressao: job antigo nao conclui como done se foi supersedido/cancelado durante execucao.
+
+APIs adicionadas em src/db.ts:
+
+- dbGetIssueWorkState
+- dbGetJobState
+- dbIsJobSuperseded
+- dbMarkJobStale
+- dbMarkJobCancelled
+
+## 12.1 Abstracao de backend de fila/lock (fase 18)
+
+Contratos:
+
+- src/queue/backend.ts define `QueueBackend` e `LockBackend`.
+- src/queue/sql-backend.ts implementa adapter SQL e expoe factory por feature flag.
+
+Feature flag:
+
+- `QUEUE_BACKEND=sql` (padrao atual)
+- `QUEUE_BACKEND=redis` (planejado; ainda nao implementado)
+
+Regra de arquitetura:
+
+- Worker e webhook dependem do contrato abstrato; nao chamam SQL direto.
+
+Conformidade de backend:
+
+- Testes de worker exercitam o contrato usando mocks de `QueueBackend` e `LockBackend`, garantindo independencia de storage.
+
+Runbook de migracao sem downtime relevante:
+
+1. Implementar adapter Redis aderente ao contrato.
+2. Rodar testes de conformidade e regressao funcional.
+3. Habilitar canario com `QUEUE_BACKEND=redis` em subset de workers.
+4. Monitorar throughput, retries, stale/cancelled e latencia de claim.
+5. Escalonar cutover gradualmente.
+6. Em erro, rollback por feature flag para `QUEUE_BACKEND=sql`.
+
 ## 8. Calculo de custo
 
 Arquivo: src/cost.ts
@@ -315,13 +510,15 @@ Bitbucket:
 Arquivo: codebases.json
 
 Estrutura:
-- codebases[] com name, path, description e modules[]
+- codebases[] com name, repository_url, description e modules[]
+- path e opcional; quando ausente e inferido pelo slug do repository_url em CODEBASES_ROOT
 
 Uso:
 - Analista e implementador consomem list_codebases/list_modules para orientar exploracao do repositorio-alvo.
+- Antes da primeira operacao em uma codebase, o sistema executa clone automatico on-demand quando o repositorio nao existe localmente.
 
 Fallback:
-- Se configuracao ausente/invalida, usa CODEBASE_PATH ou /workspace.
+- Sem entries validas em codebases.json, a lista de codebases fica vazia.
 
 ## 13. Infra e execucao
 
@@ -342,7 +539,7 @@ Detalhes relevantes:
 - Runtime com usuario nao-root
 - gh e uvx instalados na imagem
 - known_hosts pre-populado para github/gitlab/bitbucket
-- Volume externo de codebase montado em /workspace/versa-saude no compose atual
+- Codebases sao clonadas para volume interno do container em /workspace/codebases
 
 ## 14. Endpoint e contrato de webhook
 
@@ -374,15 +571,15 @@ Comportamento de resposta:
 - technical_spec depende de JIRA_ANALYST_FIELD_ID configurado.
 
 4. Exposicao de contexto
-- codebases.json atual contem descricao extensa de dominio e caminhos absolutos externos; revisar se isso deve estar versionado.
+- codebases.json pode conter contexto extenso de dominio; revisar periodicamente o que deve ser versionado.
 
 ## 16. Evolucoes recomendadas
 
-1. Evoluir politica de discovery dinamico com suporte a filtros por projeto/equipe.
+1. Evoluir gerenciamento de clones (prefetch seletivo, prune e cache inteligente).
 2. Expandir testes para casos mais complexos de ADF (nested nodes e tabelas extensas).
 3. Adicionar validacao de assinatura do webhook por provedor (caso use multiplos emissores).
 4. Instrumentar metricas de healthcheck para monitoramento externo.
-5. Criar cache persistente opcional para index de codebases descobertos.
+5. Criar cache persistente opcional para metadados de repositorios clonados.
 
 ## 17. Mapa de arquivos
 
