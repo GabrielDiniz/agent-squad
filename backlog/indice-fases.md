@@ -1,6 +1,6 @@
 # Indice de Fases do Backlog
 
-Atualizado em: 2026-05-30
+Atualizado em: 2026-05-31
 
 ## Aguardando inicio
 
@@ -32,6 +32,7 @@ Atualizado em: 2026-05-30
 18. [17 - Cancelamento, Supersedencia e Ordem](done/phases/17-cancelamento-supersedencia-ordem.md)
 19. [18 - Abstracao de Backend e Migracao para Redis](done/phases/18-abstracao-backend-migracao-redis.md)
 20. [19 - Otimizacao de Tokens e Ciclos dos Agentes](done/phases/19-otimizacao-tokens-ciclos-agentes.md)
+21. [20 - Retomada Resiliente com Estado de Execucao dos Agentes](done/phases/20-retomada-resiliente-estado-agentes.md)
 
 ## To-dos concluidos por fase
 
@@ -65,3 +66,10 @@ Atualizado em: 2026-05-30
 - Estratégia: prompt enxuto, modo tool-first, budget de tokens, sumarização incremental e cache por issue.
 - Status: concluída.
 - Tracking: fase 19 em [backlog/done/phases/19-otimizacao-tokens-ciclos-agentes.md](done/phases/19-otimizacao-tokens-ciclos-agentes.md) com TODO em [backlog/done/todos/19-otimizacao-tokens-ciclos-agentes/TODO.md](done/todos/19-otimizacao-tokens-ciclos-agentes/TODO.md).
+
+## Iniciativa concluida 04
+
+- Objetivo: habilitar retomada real de execucao apos falhas com checkpoint incremental de estado dos agentes.
+- Estratégia: persistencia de estado retomavel minimo, rehydrate deterministico e replay com skip seguro de etapas elegiveis.
+- Status: concluída.
+- Tracking: fase 20 em [backlog/done/phases/20-retomada-resiliente-estado-agentes.md](done/phases/20-retomada-resiliente-estado-agentes.md) com TODO em [backlog/done/todos/20-retomada-resiliente-estado-agentes/TODO.md](done/todos/20-retomada-resiliente-estado-agentes/TODO.md).

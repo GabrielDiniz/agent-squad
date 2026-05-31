@@ -289,3 +289,70 @@ Efetuar rollback se houver qualquer condição abaixo por janela de observação
 2. Reiniciar processo/containers para aplicar configuração.
 3. Reenfileirar apenas issues impactadas.
 4. Registrar evidências (logs, métricas, delta antes/depois) e ajustar limites.
+
+## 14. Retomada resiliente (Fase 20)
+
+### 14.1 Fluxo de resume (cold vs warm)
+
+1. Worker tenta carregar último checkpoint válido por `job_id`.
+2. Se checkpoint compatível com versão, injeta `resumeCheckpointState` no agente.
+3. Se checkpoint ausente, incompatível ou erro de leitura, faz fallback para cold start.
+4. Durante execução, agente salva checkpoints incrementais por turno e eventos críticos.
+5. Worker emite telemetria consolidada (`load_hit`, `save_failed`, `resume_*`, `turns_skipped`, `tools_skipped`).
+
+### 14.2 Contrato e governança de checkpoint
+
+- `ExecutionCheckpointState` inclui `core`, `context` e `toolProgress`.
+- Persistência aplica governança antes de gravar:
+  - higienização de campos sensíveis (tokens/segredos/credenciais);
+  - truncamento seguro de strings e payload;
+  - remoção progressiva de `cachedResult` quando necessário;
+  - pruning por `job_id` para manter apenas os N checkpoints mais recentes.
+- Persistência usa envelope com metadados de validade:
+  - `stateHash` (`sha256`) para integridade do estado;
+  - `validity` com campos alterados e indicação de delta/full;
+  - armazenamento em delta quando menor que snapshot full.
+- Compatibilidade por versão:
+  - `RESUME_CHECKPOINT_VERSION` define versão atual;
+  - `RESUME_CHECKPOINT_MIN_COMPAT_VERSION` define faixa mínima aceita;
+  - checkpoint incompatível é invalidado e execução segue em cold start.
+- Em cancelamento/supersedencia cooperativa, checkpoints do job são invalidados.
+- Rehydrate respeita timeout configurável (`RESUME_REHYDRATE_TIMEOUT_MS` e overrides por agente).
+
+### 14.3 Quality gates por risco
+
+- Flags:
+  - `RESUME_ENABLE_QUALITY_GATES`
+  - `*_ENABLE_QUALITY_GATES`
+  - `*_QUALITY_GATE_RISK_THRESHOLD`
+- Em risco alto, o agente exige evidência `QUALITY_GATE_OK:` antes de permitir transição terminal.
+- Sem evidência, a transição final é bloqueada com mensagem corretiva (`QUALITY_GATE_REQUIRED`).
+
+### 14.4 Runbook de incidentes
+
+Checkpoint inválido/incompatível:
+
+1. Verificar logs `version_mismatch` e `load_failed`.
+2. Ajustar faixa de compatibilidade (`RESUME_CHECKPOINT_MIN_COMPAT_VERSION`) se aplicável.
+3. Manter canário em cold start até estabilização.
+
+Fallback frequente:
+
+1. Monitorar `resume_fallback` por agente.
+2. Validar integridade dos payloads e pruning.
+3. Reduzir escopo do rollout para o último agente estável.
+
+Falha recorrente de save:
+
+1. Verificar conectividade/latência MySQL.
+2. Inspecionar logs de governança (`truncated`, `redacted_fields`, `dropped_cached_results`).
+3. Ajustar limites (`RESUME_CHECKPOINT_MAX_*`) e reavaliar.
+
+### 14.5 Mitigação operacional de rollback de migração
+
+- A migração de checkpoints é aditiva (tabela/índices novos).
+- Rollback operacional padrão:
+  1. desabilitar resume/replay/quality gates por flags;
+  2. manter tabela para auditoria e limpeza posterior;
+  3. executar limpeza controlada por janela de retenção;
+  4. remover objetos SQL apenas em janela de manutenção dedicada.
