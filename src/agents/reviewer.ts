@@ -226,6 +226,22 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
           }
         }
         messages.push({ role: "user", content: results });
+      } else if (response.stop_reason === "max_tokens") {
+        // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
+        // priorizando tool_use para evitar novo estouro por texto longo.
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "CONTINUE do ponto exato onde parou, sem repetir contexto. " +
+                "Se faltar ação de ferramenta, responda apenas com o próximo tool_use necessário. " +
+                "Evite texto longo; mantenha saídas objetivas.",
+            },
+          ],
+        });
+        continue;
       } else {
         // max_tokens ou stop_sequence — interrompe sem corromper o histórico
         console.log(`\n[reviewer] stop_reason inesperado: ${response.stop_reason}`);

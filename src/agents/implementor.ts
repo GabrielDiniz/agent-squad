@@ -3,7 +3,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
-import { jiraGetIssue, jiraTransitionToStatus } from "../jira.js";
+import { jiraGetIssue, jiraTransitionToStatus, jiraAddComment } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { buildAuthenticatedUrl, createPullRequest } from "../git.js";
@@ -224,6 +224,13 @@ function execBashExec(
     if (!ALLOWED_EXEC_CMD.test(seg.trim())) {
       return `Erro: "${seg.trim()}" não é um comando git/gh permitido.`;
     }
+  }
+
+  // Evita criação de PR via GH CLI (gh pr create), pois esse fluxo depende de
+  // permissões GraphQL variáveis por token/organização e quebra com frequência.
+  // Padronizamos abertura de PR/MR na tool create_pull_request.
+  if (/^gh\s+pr\s+create\b/i.test(trimmed)) {
+    return "Erro: use a tool create_pull_request para abrir PR/MR (gh pr create desabilitado).";
   }
 
   // Before creating a feature branch: sync local master to origin/master,
@@ -512,6 +519,18 @@ O restante do arquivo é preservado integralmente.`,
     },
   },
   {
+    name: "jira_add_comment",
+    description: "Adiciona um comentário a um issue do Jira. Use obrigatoriamente quando houver erro de clone ou acesso ao repositório, descrevendo o problema e possíveis causas.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        issue_key: { type: "string" },
+        comment: { type: "string", description: "Comentário em Markdown" },
+      },
+      required: ["issue_key", "comment"],
+    },
+  },
+  {
     name: "jira_transition_issue",
     description: "Muda o status de um issue do Jira para um novo status.",
     input_schema: {
@@ -611,8 +630,18 @@ function buildPrompt(issueKey: string): string {
    - body (Markdown): link Jira + lista do que foi implementado + como testar
    - head_branch: ${issueKey}
    - base_branch: master (ou a branch padrão do projeto)
+  - **Nunca** use \'gh pr create\' no bash_exec.
 
 8. **Transitar** o status do issue para "${DONE_STATUS}".
+
+## Tratamento de erros de acesso ao código
+
+Se ao tentar acessar qualquer codebase (list_modules, bash_read, write_file, patch_file, bash_exec) ocorrer um erro de clone, autenticação ou acesso ao repositório:
+1. **Poste imediatamente um comentário** no issue ${issueKey} via \`jira_add_comment\` com:
+   - Descrição clara do erro recebido
+   - Possíveis causas (credenciais inválidas/ausentes, URL errada, permissão negada, timeout, etc.)
+   - Orientação para corrigir e re-enfileirar a demanda
+2. Não tente prosseguir com a implementação sem o código — encerre após postar o comentário.
 
 Seja fiel à especificação técnica. Siga os padrões de código existentes no projeto.`;
 }
@@ -627,7 +656,29 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
     if (!entry) {
       throw new Error(`Codebase "${codebaseName}" não encontrado. Disponíveis: ${codebases.map((c) => c.name).join(", ")}`);
     }
-    await ensureCodebaseCloned(entry);
+    try {
+      await ensureCodebaseCloned(entry);
+    } catch (cloneErr) {
+      const msg = String(cloneErr);
+      const comment =
+        `## ⚠️ Erro de acesso ao repositório\n\n` +
+        `O agente implementador não conseguiu acessar o codebase **${codebaseName}** necessário para implementar esta demanda.\n\n` +
+        `**Erro:**\n\`\`\`\n${msg}\n\`\`\`\n\n` +
+        `**Possíveis causas:**\n` +
+        `- Credenciais Git ausentes ou expiradas (verifique \`GIT_TOKEN\` / \`GIT_USER\`/\`GIT_PASSWORD\` nas variáveis de ambiente)\n` +
+        `- URL do repositório incorreta ou inacessível (verifique \`repository_url\` em codebases.json)\n` +
+        `- Repositório privado sem permissão de leitura/escrita para o token configurado\n` +
+        `- Falha de rede ou timeout ao clonar (verifique conectividade e \`CODEBASE_CLONE_TIMEOUT_MS\`)\n` +
+        `- Caminho local do codebase sem permissão de escrita (verifique \`CODEBASES_ROOT\`)\n\n` +
+        `Corrija o problema e re-enfileire a demanda.`;
+      try {
+        await jiraAddComment(issueKey, comment);
+        console.warn(`[implementor] ${issueKey}: comentário de erro de clone postado para "${codebaseName}"`);
+      } catch (commentErr) {
+        console.warn(`[implementor] aviso: não foi possível postar comentário de erro: ${commentErr}`);
+      }
+      throw cloneErr;
+    }
     return entry;
   }
 
@@ -784,13 +835,49 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
 
               } else if (block.name === "create_pull_request") {
                 const entry = await resolveCodebaseOrError(inp.codebase as string);
-                result = await createPullRequest({
-                  cwd: entry.path,
-                  title: inp.title as string,
-                  body: inp.body as string,
-                  headBranch: inp.head_branch as string,
-                  baseBranch: inp.base_branch as string,
-                });
+                try {
+                  result = await createPullRequest({
+                    cwd: entry.path,
+                    title: inp.title as string,
+                    body: inp.body as string,
+                    headBranch: inp.head_branch as string,
+                    baseBranch: inp.base_branch as string,
+                  });
+                } catch (prErr) {
+                  const errMsg = String(prErr);
+                  const branch = String(inp.head_branch ?? issueKey);
+                  const provider = (process.env.GIT_PROVIDER ?? "github").toLowerCase();
+                  const providerHints =
+                    provider === "github"
+                      ? "- Token sem escopo suficiente no GitHub (Fine-grained: Pull requests Read/Write + Contents Read/Write; Classic: repo)\\n- Token sem acesso ao repositório alvo\\n- Repositório com política que bloqueia criação de PR por API"
+                      : provider === "gitlab"
+                        ? "- GITLAB_TOKEN sem escopo api\\n- Token sem permissão no projeto (Developer/Maintainer)"
+                        : provider === "bitbucket"
+                          ? "- BITBUCKET_APP_PASSWORD sem permissão Repositories:Read/Write\\n- App password vinculado a usuário sem acesso ao repositório"
+                          : "- AZURE_DEVOPS_PAT sem escopo Code (Read & Write)\\n- PAT sem acesso ao projeto/repositório no Azure DevOps";
+
+                  const comment =
+                    `## ⚠️ Falha ao criar Pull Request\\n\\n` +
+                    `O agente implementador concluiu as alterações e fez push da branch, mas não conseguiu abrir a PR/MR automaticamente.\\n\\n` +
+                    `**Branch publicada:** \`${branch}\`\\n` +
+                    `**Codebase:** \`${String(inp.codebase ?? "(não informado)")}\`\\n\\n` +
+                    `**Erro retornado:**\\n\`\`\`\\n${errMsg}\\n\`\`\`\\n\\n` +
+                    `**Possíveis causas (${provider}):**\\n${providerHints}\\n\\n` +
+                    `**Ação recomendada:** ajustar permissões do token e reexecutar a automação, ou abrir a PR/MR manualmente para a branch \`${branch}\`.`;
+
+                  try {
+                    await jiraAddComment(issueKey, comment);
+                    console.warn(`[implementor] ${issueKey}: comentário de falha de PR postado no Jira.`);
+                  } catch (commentErr) {
+                    console.warn(`[implementor] aviso: não foi possível postar comentário de falha de PR: ${commentErr}`);
+                  }
+
+                  result = `Erro: ${errMsg}`;
+                }
+
+              } else if (block.name === "jira_add_comment") {
+                await jiraAddComment(inp.issue_key as string, inp.comment as string);
+                result = "Comentário adicionado.";
 
               } else if (block.name === "jira_transition_issue") {
                 result = await jiraTransitionToStatus(
@@ -808,6 +895,22 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
           }
         }
         messages.push({ role: "user", content: results });
+      } else if (response.stop_reason === "max_tokens") {
+        // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
+        // priorizando tool_use para evitar novo estouro por texto longo.
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "CONTINUE do ponto exato onde parou, sem repetir contexto. " +
+                "Se faltar ação de ferramenta, responda apenas com o próximo tool_use necessário. " +
+                "Evite texto longo; mantenha saídas objetivas.",
+            },
+          ],
+        });
+        continue;
       } else {
         console.log(`\n[implementor] stop_reason inesperado: ${response.stop_reason}`);
         break;

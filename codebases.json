@@ -1,99 +1,100 @@
 {
   "codebases": [
+    
     {
-      "name": "versa-saude",
-      "repository_url": "https://gitlab.com/org/versa-saude.git",
-      "description": "Aplicação web monolítica em Laravel + MySQL, padrão MVC. Estrutura flat: Controllers em app/Http/Controllers, Models em app/Models, Services em app/Services, Repositories em app/Repositories. Módulos identificados por prefixo de nome de classe, sem subpastas dedicadas (exceto Upa, Agenda, VersaSocial e Api).",
+      "name": "rhhealth-portal",
+      "repository_url": "git@github.com:GabrielDiniz/ccare.git",
+      "description": "Portal web baseado em CakePHP v1.3 (php5.3) para gestão de saúde ocupacional, segurança do trabalho e RH. Sistema monolítico com suporte a múltiplos clientes (multi-tenant). Padrão MVC: Controllers em app/controllers/, Models em app/models/, Views em app/views/. Suporta integração com múltiplas APIs externas (OMIE, Vtiger, SMS, WhatsApp, e-Social, esocial). Relatórios via Jasper Reports. Autenticação via LDAP e Azure AD.",
       "modules": [
         {
-          "name": "regulacao",
-          "description": "Regulação de marcações: cotas, procedimentos, prestadores e profissionais de saúde. Rotas: /regulacao, /regulacao-quantitativa, /marcacao, /marcacao-pendencias, /marcacao-agrupada, /marcacao-arquivos, /cota, /cota-procedimento, /prestador, /procedimento.",
-          "keywords": ["Regulacao", "Marcacao", "Cota", "Prestador", "CotaProcedimento", "RegulacaoQuantitativa", "MarcacaoPendencia", "MarcacaoAgrupada"]
+          "name": "gestao_clientes",
+          "description": "Gestão completa de clientes e contatos: cadastro, endereços, contatos, históricos, implementação, IPs, operações, procurações, relacionamentos, dados de autenticação. Suporta multi-empresa e multi-cliente. Controllers: clientes_*, cliente_*.",
+          "keywords": ["cliente", "contato", "endereco", "historico", "implementacao", "ip", "operacao", "procuracao", "relacionamento", "fonte_autenticacao", "multi_empresa"]
         },
         {
-          "name": "tfd",
-          "description": "Tratamento Fora de Domicílio: marcações, guias, viagens, calendário e solicitações de TFD. Rotas: /marcacao-tfd, /guia-tfd, /cidadao-agendamento-tfd, /viagens-tfd, /calendario-viagens, /solicitacoes-viagens, /registros-viagens.",
-          "keywords": ["Tfd", "MarcacaoTFD", "ViagemTfd", "GuiaTfd", "CidadaoAgendamentoTFD", "ViagensTfd", "SolicitacaoExtraordinaria"]
+          "name": "recursos_humanos",
+          "description": "Gestão de RH: funcionários, cargos, atribuições, matrículas, setores, funções, disciplinas, absenteísmo, escalas, expedientes, sensores de ponto. Integração com sistema de pontuação eletrônica. Controllers: funcionarios_*, cargos*, atribuicoes*, setores*, funcoes*, usuario_* relacionados a RH.",
+          "keywords": ["funcionario", "cargo", "atribuicao", "matriz", "setor", "funcao", "absenteismo", "escala", "ponto_eletronico", "expediente"]
         },
         {
-          "name": "transporte",
-          "description": "Gestão de frota: veículos, abastecimento, manutenção, multas, rotas e profissionais de transporte. Rotas: /veiculo, /abastecimento-veiculo, /manutencao-veiculo, /multa-veiculo, /rota-veiculo, /profissionais-transporte.",
-          "keywords": ["Veiculo", "ProfissionalTransporte", "Abastecimento", "Manutencao", "VeiculoRota", "VeiculoMulta"]
+          "name": "saude_ocupacional",
+          "description": "Saúde ocupacional e segurança do trabalho: exames, procedimentos, PCMSO, PPRA, laudos, atestados, fichas clínicas, audiometrias, fatores de risco (EPC, EPI), grupos homogêneos. Controllers: exames*, atestados*, fichas*, audiometrias*, grupos_homogeneos*, riscos*.",
+          "keywords": ["exame", "atestado", "pcmso", "ppra", "ficha_clinica", "audiometria", "risco", "epc", "epi", "grupo_homogeneo", "laudoApac"]
         },
         {
-          "name": "bpa",
-          "description": "Boletim de Produção Ambulatorial: geração de arquivo BPA, integração com e-SUS, BPA de UPA e de transporte. Rota: /bpa.",
-          "keywords": ["Bpa", "BpaService", "BpaTransporte", "BpaUpa", "BpaEspecialidade"]
+          "name": "agendamento_consultas",
+          "description": "Agendamento de consultas e atendimentos: agenda de profissionais, fornecedores, calendários, horáriossintomas bloqueados/diferenciados, capacidade de agenda. Controllers: agendamento*, consultas*, fornecedores_capacidade_agenda*, fornecedor_horario*.",
+          "keywords": ["agendamento", "consulta", "agenda", "calendario", "horario", "fornecedor", "sala_atendimento"]
         },
         {
-          "name": "almoxarifado",
-          "description": "Almoxarifado e controle de estoque: produtos, lotes, solicitações internas, distribuições, devoluções, fornecedores. Rotas: /estoque, /ubs-estoque, /produtos, /produtos-lote, /produtos-solicitacao, /distribuicoes-internas, /solicitacoes-internas, /devolucao-produto, /fornecedor, /grupo-material.",
-          "keywords": ["Estoque", "Produto", "ProdutosLote", "ProdutosSolicitacao", "DevolucaoProduto", "DistribuicoesInternas", "SolicitacoesInternas", "Fornecedor", "GrupoMaterial", "ReivindicacaoDistribuicao"]
+          "name": "faturamento",
+          "description": "Gestão de faturamento: pedidos, itens, notas fiscais, glosas, pré-faturamento, formas de pagamento, remessas bancárias, contas médicas, cotações. Integração com OMIE. Controllers: pedidos*, notas_fiscais*, glosas*, pre_faturamento*, formas_pagto*, contas_medicas*.",
+          "keywords": ["pedido", "nota_fiscal", "glosa", "pre_faturamento", "forma_pagto", "remessa_bancaria", "conta_medica", "cotacao", "faturamento"]
         },
         {
-          "name": "farmacia",
-          "description": "Farmácia: dispensação, tratamento contínuo, princípios ativos, solicitações de medicamentos, prescrições. Rotas: /dispensacao, /tratamento-continuo, /principios-ativos, /medicamentos-solicitacao, /procura-medicamento, /prescricao-medicamento.",
-          "keywords": ["Dispensacao", "TratamentoContinuo", "PrincipiosAtivo", "MedicamentosSolicitacao", "PrescricaoMedicamento", "RegistroProcuraMedicamentos"]
+          "name": "almoxarifado_suprimentos",
+          "description": "Gestão de produtos, mercadorias, estoque, fornecedores e listas de preço. Controle de EPI/EPC. Controllers: produtos*, mercadorias*, fornecedores*, listas_de_preco*, epi*, epc*.",
+          "keywords": ["produto", "mercadoria", "fornecedor", "lista_preco", "epi", "epc", "entrega_epi"]
         },
         {
-          "name": "agendamento",
-          "description": "Agenda de consultas: agenda por profissional e recepção, configuração de agenda, agendamentos agrupados e e-SUS. Rotas: /agenda-profissional, /agenda-recepcao, /configuracao-agenda, /agendamentos-agrupados, /agendamento-esus, /cidadao-agendamento.",
-          "keywords": ["Agenda", "AgendaMunicipio", "Agendamento", "ConfiguracaoAgenda", "AgendamentoAgrupado", "AgendamentoEsus"]
+          "name": "logistica_frota",
+          "description": "Gestão de frota e logística: veículos (tipos, modelos, fabricantes, classificação), motoristas, rotas, viagens, rastreadores, ocorrências de viagem, paradas, cargas. Controllers: veiculos*, motoristas*, rotas*, viagens*, rest_viagens*, rastreador*.",
+          "keywords": ["veiculo", "motorista", "rota", "viagem", "rastreador", "ocorrencia_viagem", "carga", "parada", "tipo_transporte", "modelo_viagem"]
         },
         {
-          "name": "prontuario",
-          "description": "Prontuário eletrônico (SOAP): consultas, atendimentos, escuta inicial, alergias, atestados, exames, lembretes, orientações, encaminhamentos, evolução odontológica, problemas/condições. Rotas: /prontuario, /consulta, /atendimento, /escuta-inicial, /alergias, /atestados, /exames-requisicao, /exames-solicitados-avaliados, /lembretes, /orientacoes, /encaminhamentos, /evolucao-odonto, /problemas-condicoes.",
-          "keywords": ["Prontuario", "Consulta", "Atendimento", "Alergias", "Atestado", "Exame", "Lembrete", "Encaminhamento", "EvolucaoOdonto", "EscutaInicial", "ProblemaCondicao", "Orientacao", "HistoricoService"]
+          "name": "integracao_apis",
+          "description": "Integrações com sistemas externos: OMIE (ERP), Vtiger (CRM), SMS/WhatsApp (mensageria), e-Social, esocial, Sendgrid (email), Nexo (DORT), Vindi (pagamentos), integração de dados de saúde (e-SUS), Azure AD. Controllers e Services para cada integração.",
+          "keywords": ["api", "omie", "vtiger", "sms", "whatsapp", "esocial", "sendgrid", "nexo", "vindi", "esus", "azuread", "integracao"]
         },
         {
-          "name": "atendimento_especializado",
-          "description": "Atendimento especializado ambulatorial: APAC/LAUDO e guia Susfácil. Rotas: /laudo-apac, /guia-susfacil.",
-          "keywords": ["AtendimentoEspecializado", "LaudoApac", "GuiaSusfacil"]
+          "name": "relatorios",
+          "description": "Geração de relatórios via Jasper Reports (121 templates JRXML). Modo local (PHP/Java) ou remoto (API - Document Hub). ReportServiceFactory gerencia a estratégia. Controllers dedicados para relatórios específicos.",
+          "keywords": ["relatorio", "jasper", "jrxml", "reportservice", "document_hub", "print", "exportacao"]
         },
         {
-          "name": "upa",
-          "description": "Unidade de Pronto Atendimento: triagem, recepção, atendimento, internação, medicação, SAE, prescrição, exame, AIH, CCIH, assinatura. Controllers em app/Http/Controllers/Upa/, Services em app/Services/Upa/. Rotas: /upa-*.",
-          "keywords": ["Upa", "GuiaAih", "GuiaCcih"]
+          "name": "comunicacao_pacientes",
+          "description": "Sistema de comunicação: SMS (Vindi/SendGrid), WhatsApp, pesquisas de satisfação, IVR, mensagens, notificações, outbox. Controllers: sms*, atendimentos_sms*, pesquisas_satisfacao*, outbox*.",
+          "keywords": ["sms", "whatsapp", "pesquisa_satisfacao", "ivr", "mensagem", "notificacao", "outbox", "comunicacao"]
         },
         {
-          "name": "esus_cds",
-          "description": "Integração e-SUS/CDS: cadastro individual, domicílios, visitas domiciliares, sincronização com RNDS, encaminhamentos e-SUS. Rotas: /esus, /esus-sincronizacao, /cds-cadastro-individual, /cds-domicilio, /cds-visita-domiciliar, /cds-inconsistencias, /integracao-esus, /encaminhamentos-esus.",
-          "keywords": ["Esus", "Cds", "CadastroIndividual", "VisitaDomiciliar", "EsusSincronizacao", "IntegracaoEsus", "EncaminhamentosEsus", "Xml"]
+          "name": "gestao_credenciamento",
+          "description": "Gestão de credenciamento de profissionais e fornecedores: propostas de credenciamento, validação, profissionais, médicos, especialidades, documentos, fotos. Controllers: propostas_credenciamento*, profissionais*, medicos*.",
+          "keywords": ["proposta_credenciamento", "profissional", "medico", "especialidade", "validacao", "documento_credenciamento", "foto"]
         },
         {
-          "name": "cidadao",
-          "description": "Cadastro e gestão de cidadãos: perfil, atualização cadastral, integração CADSUS, unificação de registros. Rotas: /cidadao, /cadsus, /cidadao-atualizacao.",
-          "keywords": ["Cidadao", "Cadsus", "CidadaoAtualizacao", "CidadaoSyncService", "CidadaoUnificado"]
+          "name": "seguranca_acesso",
+          "description": "Segurança e controle de acesso: usuários, perfis, permissões ACL, subperfis, auditorias, logs de acesso, IPs permitidos, múltiplos clientes/empresas por usuário, Azure AD. Controllers: usuarios*, perfil*, uperfil*, objetos_acl*, usuarios_logs*.",
+          "keywords": ["usuario", "perfil", "permissao", "acl", "auditoria", "log_acesso", "ip", "azure_ad", "ldap"]
         },
         {
-          "name": "vigilancia_sanitaria",
-          "description": "Vigilância Sanitária: estabelecimentos, categorias, inspeções, protocolos, alvarás e seus arquivos. Classes prefixadas com ViSa. Rotas: /estabelecimentos, /categorias-estabelecimentos, /inspecoes, /protocolos, /alvaras, /arquivos-*.",
-          "keywords": ["ViSa", "Alvara", "Estabelecimento", "Inspecao", "Protocolo"]
+          "name": "parametrizacao_sistema",
+          "description": "Configurações gerais do sistema: parâmetros, tabelas de referência (CBO, CID, CNAE, especialidades), tipos de documentos, motivos (cancelamento, recusa, etc), critérios, tabelas de configuração. Controllers: configuracoes*, parametros*, tipos_*, motivos*.",
+          "keywords": ["parametro", "configuracao", "cbo", "cid", "cnae", "especialidade", "tipo", "motivo", "criterio", "tabela"]
         },
         {
-          "name": "vigilancia_epidemiologica",
-          "description": "Vigilância Epidemiológica (ACE): imóveis, localidades, visitas endêmicas, rotas, supervisão, laboratório, mapas epidemiológicos. Rotas: /localidades, /imoveis, /rotas-ace, /visitas-endemicas, /supervisao, /laboratorio, /mapas-epidemiologicos.",
-          "keywords": ["VigilanciaSaude", "VigilaciaSaude", "MapasEpidemiologicos", "Endemica", "Imovel", "Laboratorio", "RotaAce", "QuarteiraoConcluidoCiclo"]
+          "name": "validacoes_regras_negocio",
+          "description": "Aplicação de regras de negócio e validações: validadores de dados, critérios de aceite (SM), regras de distribuição, exceções de faturamento, validações de profissionais/proprietários. Controllers: criterios*, regras_aceite_sm*, objetivo_excecao_faturamento*.",
+          "keywords": ["validacao", "regra", "criterio", "aceite", "excecao", "distribuicao", "negocio"]
         },
         {
-          "name": "versa_social",
-          "description": "Módulo em desenvolvimento: referência e contrarreferência entre serviços de saúde. Controllers em app/Http/Controllers/VersaSocial/, Services em app/Services/VersaSocial/.",
-          "keywords": ["VersaSocial", "Referencia", "ContraReferencia", "SolicitacaoReferencia", "CidadaoIdentificacao"]
+          "name": "processamento_fila",
+          "description": "Processamento em background e fila: processamentos assíncrono, automações PCMSO, integração e-Social com fila, importações (layouts, SFTP), sincronizações. Controllers: processamentos*, importacao*, int_esocial*, monitora*.",
+          "keywords": ["processamento", "fila", "assincrono", "automacao", "importacao", "sincronizacao", "monitora", "batch"]
         },
         {
-          "name": "api_cds",
-          "description": "API REST para o app mobile de CDS (Coleta de Dados Simplificada). Autentica agentes comunitários e sincroniza domicílios, indivíduos avulsos, visitas domiciliares, ocorrências e arquivos. Controllers em app/Http/Controllers/ApiCds/, Services em app/Services/ApiCds/. Rotas em apiPassport.php: /cds/auth, /cds/domicilio, /cds/individuos/avulsos, /cds/visitas, /cds/ocorrencias, /cds/arquivos.",
-          "keywords": ["ApiCds", "ApiCdsDomicilio", "ApiCdsIndividuo", "ApiCdsVisita", "ApiCdsOcorrencia", "ApiCdsArquivo", "ApiCdsTransferencia", "ApiCDSAuth"]
+          "name": "gestao_documentos",
+          "description": "Gestão eletrônica de documentos: templates de documento, modelo de contrato, criação de layout, assinatura eletrônica, digitalização, arquivo de documentos, anexos. Controllers: documento_*, criacao_layouts*, assinatura_eletronica*.",
+          "keywords": ["documento", "template", "contrato", "assinatura_eletronica", "digitalizacao", "anexo", "arquivo"]
         },
         {
-          "name": "api_vigilancia",
-          "description": "API REST para o app mobile de Vigilância Epidemiológica (ACE — Agente de Combate a Endemias). Autentica agentes, sincroniza rotas ACE, localidades, imóveis, visitas endêmicas e supervisão. Controller: app/Http/Controllers/API/V1/ApiVigilanciaSaudeController.php, Services: app/Services/Api/. Rotas em apiPassport.php: /vigilancia/autenticacao, /vigilancia/rotas-ace, /vigilancia/localidades, /vigilancia/imoveis, /vigilancia/visitas, /vigilancia/supervisao.",
-          "keywords": ["ApiVigilanciaSaude", "ValidarDadosApiAce", "ApiEsusService", "ApiPrestador"]
+          "name": "indicadores_analytics",
+          "description": "Indicadores, analytics e dashboards: painel geral (Dashboard), painel SGI, estatísticas SMS/Viagens, relatórios de performance, cockpit de dados, DRE (Demonstração de Resultado do Exercício), scorecard. Controllers: painel*, relatorios_*, estatisticas*.",
+          "keywords": ["painel", "dashboard", "indicador", "estatistica", "relatorio_analise", "scorecard", "dre", "cockpit", "analytics"]
         },
         {
-          "name": "impressao_relatorios",
-          "description": "Toda impressão de documentos e relatórios usa Jasper Reports via padrão Factory. A classe ReportServiceFactory (app/Factories/ReportServiceFactory.php) decide o modo de geração em dois níveis: (1) env REPORTS_MODE=local|api define o padrão global; (2) o arquivo resources/data/relatorios.csv lista relatórios que SEMPRE usam modo API, independente do REPORTS_MODE. Atualmente 5 relatórios estão no CSV (migrados para API): MarcacaoProtocoloUmaPagina.jrxml, MarcacaoProtocoloDuasPaginas.jrxml, RequisicaoProcedimento.jrxml, ViagensTfdRequisicoes.jrxml, RequisicaoProcedimentoTFD.jrxml. MODO LOCAL (PHPJasperReportService): usa o pacote geekcom/phpjasper, requer Java + JasperStarter no servidor, conecta diretamente ao MySQL via JDBC. Suporta dois data sources: process() para relatórios SQL (passa config de banco) e processJson() para relatórios que recebem dados JSON (salva arquivo temporário em storage/reports_output/data.json). Os 121 templates .jrxml ficam em /reports/ na raiz do projeto. MODO API (ApiReportService): usa o pacote fermaiasoares/document-hub (Versatecnologia). Envia o nome do .jrxml e os parâmetros para a API remota (DOCUMENT_HUB_URL / REPORTS_URL=https://relatorios.versasaude.com.br) autenticada por DOCUMENT_HUB_API_TOKEN / REPORTS_API_KEY. A conexão com o banco de dados do tenant (multi-tenant via TenantManager) é passada como parâmetro para a API remota processar o Jasper. O PDF retornado é salvo localmente e servido ao cliente. Em ambos os modos a interface é ReportServiceInterface (getOutput, getDatabaseConfig, exibeDocumento, process, processJson). Para adicionar um relatório ao modo API basta incluir o nome do .jrxml no resources/data/relatorios.csv. Env vars relevantes: REPORTS_MODE, REPORTS_URL, REPORTS_API_KEY, DOCUMENT_HUB_URL, DOCUMENT_HUB_API_TOKEN.",
-          "keywords": ["ReportServiceFactory", "PHPJasperReportService", "ApiReportService", "ReportServiceInterface", "RelatorioService", "DocumentHub", "jrxml", "ReportsFacade"]
+          "name": "ferramentas_internas",
+          "description": "Ferramentas internas e utilitários: shell commands, helpers, components, behaviors, libs customizadas, cron jobs, processamento de eventos. Diretórios: app/libs, app/helpers, app/components.",
+          "keywords": ["shell", "helper", "component", "behavior", "lib", "cron", "evento", "utilitario", "ferramenta"]
         }
       ]
     }

@@ -23,6 +23,11 @@ services:
 
     environment:
       NODE_ENV: development
+      # Polling necessário no Windows: eventos inotify não são propagados do host
+      # para o container via bind mount (NTFS → Docker), sem isso o tsx watch
+      # nunca detecta alterações nos arquivos.
+      CHOKIDAR_USEPOLLING: "1"
+      CHOKIDAR_INTERVAL: "500"
       CODEBASES_MODE: ${CODEBASES_MODE:-url}
       CODEBASES_ROOT: ${CODEBASES_ROOT:-/workspace/codebases}
       CODEBASES_ALLOWED_HOSTS: ${CODEBASES_ALLOWED_HOSTS:-github.com,gitlab.com,bitbucket.org,dev.azure.com,ssh.dev.azure.com}

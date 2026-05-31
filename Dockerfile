@@ -35,7 +35,10 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci
 
-RUN mkdir -p /workspace && chown node:node /workspace
+# Cria /workspace/codebases com o owner correto ANTES do USER node.
+# Volumes nomeados novos/vazios herdam essa estrutura da imagem; volumes já
+# existentes com root:root devem ser recriados: docker volume rm <nome>.
+RUN mkdir -p /workspace/codebases && chown -R node:node /workspace
 
 USER node
 
@@ -102,7 +105,8 @@ RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit
 
 COPY --from=builder /app/dist ./dist
 
-RUN mkdir -p /workspace && chown -R agent:agent /workspace /app
+# Cria /workspace/codebases com o owner correto ANTES do USER agent.
+RUN mkdir -p /workspace/codebases && chown -R agent:agent /workspace /app
 
 USER agent
 

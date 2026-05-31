@@ -3,7 +3,7 @@ import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } from "../db.js";
-import { jiraGetIssue, jiraUpdateIssueField, jiraTransitionToStatus } from "../jira.js";
+import { jiraGetIssue, jiraUpdateIssueField, jiraTransitionToStatus, jiraAddComment } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
@@ -82,6 +82,18 @@ const TOOLS: Anthropic.Tool[] = [
         content: { type: "string", description: "Proposta técnica completa em Markdown" },
       },
       required: ["issue_key", "content"],
+    },
+  },
+  {
+    name: "jira_add_comment",
+    description: "Adiciona um comentário a um issue do Jira. Use obrigatoriamente quando houver erro de clone ou acesso ao repositório, descrevendo o problema e possíveis causas.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        issue_key: { type: "string" },
+        comment: { type: "string", description: "Comentário em Markdown" },
+      },
+      required: ["issue_key", "comment"],
     },
   },
   {
@@ -219,6 +231,15 @@ function buildPrompt(issueKey: string): string {
 
 7. **Transitar** o status do issue para "${DONE_STATUS}".
 
+## Tratamento de erros de acesso ao código
+
+Se ao tentar acessar qualquer codebase (list_modules, bash_read) ocorrer um erro de clone, autenticação ou acesso ao repositório:
+1. **Poste imediatamente um comentário** no issue ${issueKey} via \`jira_add_comment\` com:
+   - Descrição clara do erro recebido
+   - Possíveis causas (credenciais inválidas/ausentes, URL errada, permissão negada, timeout, etc.)
+   - Orientação para corrigir e re-enfileirar a demanda
+2. Não tente prosseguir com a análise sem o código — encerre após postar o comentário.
+
 Seja específico: cite nomes de classes, métodos, rotas e padrões já adotados no projeto.
 Tom: técnico e direto. Escreva em português.
 
@@ -257,7 +278,29 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
       const available = codebases.map((c) => c.name).join(", ");
       throw new Error(`Codebase "${codebaseName}" não encontrado. Disponíveis: ${available}`);
     }
-    await ensureCodebaseCloned(entry);
+    try {
+      await ensureCodebaseCloned(entry);
+    } catch (cloneErr) {
+      const msg = String(cloneErr);
+      const comment =
+        `## ⚠️ Erro de acesso ao repositório\n\n` +
+        `O agente analista não conseguiu acessar o codebase **${codebaseName}** necessário para analisar esta demanda.\n\n` +
+        `**Erro:**\n\`\`\`\n${msg}\n\`\`\`\n\n` +
+        `**Possíveis causas:**\n` +
+        `- Credenciais Git ausentes ou expiradas (verifique \`GIT_TOKEN\` / \`GIT_USER\`/\`GIT_PASSWORD\` nas variáveis de ambiente)\n` +
+        `- URL do repositório incorreta ou inacessível (verifique \`repository_url\` em codebases.json)\n` +
+        `- Repositório privado sem permissão de leitura para o token configurado\n` +
+        `- Falha de rede ou timeout ao clonar (verifique conectividade e \`CODEBASE_CLONE_TIMEOUT_MS\`)\n` +
+        `- Caminho local do codebase sem permissão de escrita (verifique \`CODEBASES_ROOT\`)\n\n` +
+        `Corrija o problema e re-enfileire a demanda.`;
+      try {
+        await jiraAddComment(issueKey, comment);
+        console.warn(`[analyst] ${issueKey}: comentário de erro de clone postado para "${codebaseName}"`);
+      } catch (commentErr) {
+        console.warn(`[analyst] aviso: não foi possível postar comentário de erro: ${commentErr}`);
+      }
+      throw cloneErr;
+    }
     return entry;
   }
 
@@ -380,6 +423,9 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
                   await jiraUpdateIssueField(inp.issue_key as string, fieldId, inp.content as string);
                   result = "Campo de solução técnica preenchido.";
                 }
+              } else if (block.name === "jira_add_comment") {
+                await jiraAddComment(inp.issue_key as string, inp.comment as string);
+                result = "Comentário adicionado.";
               } else if (block.name === "jira_transition_issue") {
                 result = await jiraTransitionToStatus(inp.issue_key as string, inp.status_name as string);
               } else {
@@ -392,6 +438,22 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
           }
         }
         messages.push({ role: "user", content: results });
+      } else if (response.stop_reason === "max_tokens") {
+        // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
+        // priorizando tool_use para evitar novo estouro por texto longo.
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "CONTINUE do ponto exato onde parou, sem repetir contexto. " +
+                "Se faltar ação de ferramenta, responda apenas com o próximo tool_use necessário. " +
+                "Evite texto longo; mantenha saídas objetivas.",
+            },
+          ],
+        });
+        continue;
       } else {
         console.log(`\n[analyst] stop_reason inesperado: ${response.stop_reason}`);
         break;

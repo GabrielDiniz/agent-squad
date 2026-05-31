@@ -1,8 +1,16 @@
 import "dotenv/config";
+import { setupSshKey, cleanupSshKey } from "./ssh-setup.js";
 import { startWebhookServer } from "./webhook.js";
 import { dbMigrate } from "./db.js";
 import { validateEnvironmentOrExit } from "./bootstrap.js";
 import { startWorkerFromEnv } from "./worker.js";
+
+// Configura chave SSH (GIT_SSH_KEY_B64) antes de qualquer operação git.
+// No-op se a variável não estiver definida.
+setupSshKey();
+process.on("exit", cleanupSshKey);
+process.on("SIGINT", () => { cleanupSshKey(); process.exit(0); });
+process.on("SIGTERM", () => { cleanupSshKey(); process.exit(0); });
 
 const PORT = Number(process.env.WEBHOOK_PORT ?? 3000);
 

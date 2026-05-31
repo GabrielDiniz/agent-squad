@@ -60,7 +60,6 @@ function getHeader(req: http.IncomingMessage, name: string): string | null {
 
 function signatureLooksValid(rawBody: string, secret: string, received: string | null): boolean {
   if (!received) return false;
-
   const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
   const accepted = received.startsWith("sha256=") ? received.slice(7) : received;
 
