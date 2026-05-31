@@ -38,7 +38,7 @@ function getTextFromMessages(messages: Anthropic.MessageParam[]): string {
   return chunks.join("\n");
 }
 
-function estimateComplexityScore(messages: Anthropic.MessageParam[]): number {
+export function estimateComplexityScore(messages: Anthropic.MessageParam[]): number {
   const text = getTextFromMessages(messages);
   if (!text.trim()) return 0.5;
 

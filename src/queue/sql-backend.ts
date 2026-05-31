@@ -5,7 +5,9 @@ import {
   dbCompleteJob,
   dbEnqueueJob,
   dbFailJob,
+  dbGetLatestExecutionCheckpoint,
   dbGetJobState,
+  dbInvalidateExecutionCheckpointsByJob,
   dbIsJobSuperseded,
   dbMarkJobCancelled,
   dbMarkJobStale,
@@ -15,8 +17,17 @@ import {
   dbRenewIssueLock,
   dbRenewJobLease,
   dbRetryJob,
+  dbSaveExecutionCheckpoint,
 } from "../db.js";
-import type { LockBackend, QueueBackend, EnqueueInput, EnqueueResult, QueueJobRecord } from "./backend.js";
+import type {
+  LockBackend,
+  QueueBackend,
+  EnqueueInput,
+  EnqueueResult,
+  QueueJobRecord,
+  SaveExecutionCheckpointInput,
+  ExecutionCheckpointRecord,
+} from "./backend.js";
 
 class SqlQueueLockBackend implements QueueBackend, LockBackend {
   async enqueueJob(input: EnqueueInput): Promise<EnqueueResult> {
@@ -63,6 +74,18 @@ class SqlQueueLockBackend implements QueueBackend, LockBackend {
 
   async markJobCancelled(jobId: number, workerId: string, reason: string): Promise<boolean> {
     return dbMarkJobCancelled(jobId, workerId, reason);
+  }
+
+  async saveExecutionCheckpoint(input: SaveExecutionCheckpointInput): Promise<number | null> {
+    return dbSaveExecutionCheckpoint(input);
+  }
+
+  async getLatestExecutionCheckpoint(jobId: number): Promise<ExecutionCheckpointRecord | null> {
+    return dbGetLatestExecutionCheckpoint(jobId);
+  }
+
+  async invalidateExecutionCheckpoints(jobId: number, reason: string): Promise<number> {
+    return dbInvalidateExecutionCheckpointsByJob(jobId, reason);
   }
 
   async acquireIssueLock(issueKey: string, workerId: string, jobId: number, leaseMs: number): Promise<boolean> {

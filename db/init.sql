@@ -135,6 +135,24 @@ CREATE TABLE IF NOT EXISTS issue_locks (
   INDEX idx_issue_locks_owner (owner_worker_id, owner_job_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS agent_execution_checkpoints (
+  id                        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  job_id                    BIGINT UNSIGNED       NOT NULL,
+  issue_key                 VARCHAR(50)           NOT NULL,
+  agent_type                VARCHAR(20)           NOT NULL,
+  checkpoint_version        INT UNSIGNED          NOT NULL DEFAULT 1,
+  checkpoint_seq            INT UNSIGNED          NOT NULL,
+  state_json                JSON                  NOT NULL,
+  is_valid                  TINYINT(1)            NOT NULL DEFAULT 1,
+  invalid_reason            VARCHAR(255)          DEFAULT NULL,
+  created_at                TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at                TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_agent_checkpoint_job_seq (job_id, checkpoint_seq),
+  INDEX idx_agent_checkpoint_job_seq (job_id, checkpoint_seq),
+  INDEX idx_agent_checkpoint_issue_agent (issue_key, agent_type, created_at),
+  INDEX idx_agent_checkpoint_valid (is_valid, job_id, checkpoint_seq)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE OR REPLACE VIEW queue_jobs_overview AS
 SELECT
   state,

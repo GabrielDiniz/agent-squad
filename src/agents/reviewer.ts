@@ -10,6 +10,18 @@ import {
   resolvePromptModeSetting,
   type PromptMode,
 } from "./prompt-policy.js";
+import {
+  enforceQualityGateTransition,
+  getQualityGateInstruction,
+  getQualityGateThreshold,
+  isQualityGateEnabled,
+  updateQualityGateEvidence,
+  updateQualityGateRisk,
+  type QualityGateState,
+} from "./quality-gate.js";
+import { buildCheckpointState } from "./checkpoint-state.js";
+import { getReplayCacheKey, upsertToolProgressState } from "./replay-policy.js";
+import type { ExecutionCheckpointState } from "../queue/backend.js";
 
 const client = new Anthropic();
 
@@ -37,6 +49,11 @@ const ENABLE_PROMPT_COMPACT = envFlag("REVIEWER_ENABLE_PROMPT_COMPACT", false);
 const ENABLE_SNAPSHOT = envFlag("REVIEWER_ENABLE_SNAPSHOT", true);
 const ENABLE_CACHE = envFlag("REVIEWER_ENABLE_CACHE", true);
 const ENABLE_BUDGET = envFlag("REVIEWER_ENABLE_BUDGET", true);
+const ENABLE_REPLAY_SKIP =
+  envFlag("RESUME_ENABLE_REPLAY_SKIP", false) && envFlag("REVIEWER_ENABLE_REPLAY_SKIP", false);
+const REPLAY_MAX_CACHED_RESULT_CHARS = Number(process.env.REVIEWER_REPLAY_MAX_CACHED_RESULT_CHARS ?? 12000);
+const ENABLE_QUALITY_GATES = isQualityGateEnabled("REVIEWER");
+const QUALITY_GATE_RISK_THRESHOLD = getQualityGateThreshold("REVIEWER");
 
 const PROMPT_MODE_SETTING = resolvePromptModeSetting(process.env.REVIEWER_PROMPT_MODE, ENABLE_PROMPT_COMPACT);
 const PROMPT_AUTO_POLICY = getPromptAutoPolicyConfig("REVIEWER");
@@ -82,12 +99,15 @@ const TOOLS: Anthropic.Tool[] = [
 
 export interface AgentRunOptions {
   checkpoint?: () => Promise<void>;
+  saveExecutionCheckpoint?: (checkpointSeq: number, state: ExecutionCheckpointState) => Promise<void>;
+  resumeCheckpointState?: ExecutionCheckpointState | null;
 }
 
 async function executeTool(
   name: string,
   input: Record<string, unknown>,
-  issueCache: Map<string, string>
+  issueCache: Map<string, string>,
+  onTransitionGuard?: (statusName: string) => string | null
 ): Promise<string> {
   try {
     if (name === "jira_get_issue") {
@@ -104,6 +124,9 @@ async function executeTool(
       return "Comentário adicionado.";
     }
     if (name === "jira_transition_issue") {
+      const requestedStatus = input.status_name as string;
+      const blockedReason = onTransitionGuard?.(requestedStatus);
+      if (blockedReason) return blockedReason;
       return await jiraTransitionToStatus(input.issue_key as string, input.status_name as string);
     }
     return `Tool desconhecida: ${name}`;
@@ -284,6 +307,43 @@ function getTotalBudgetTokens(
 
 async function doReview(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
   const promptController = new PromptModeController(PROMPT_MODE_SETTING, PROMPT_AUTO_POLICY);
+  let qualityGate: QualityGateState = {
+    enabled: ENABLE_QUALITY_GATES,
+    required: false,
+    passed: false,
+    maxRiskScore: 0,
+    blockedTransitions: 0,
+  };
+  let qualityGateInstructionSent = false;
+  const resumeState = options?.resumeCheckpointState ?? null;
+  const resumeEnabled = (process.env.REVIEWER_ENABLE_RESUME ?? process.env.RESUME_ENABLE_FUNCTIONAL ?? "0") !== "0";
+  const shouldResume = resumeEnabled && !!resumeState;
+
+  const saveCheckpoint = async (summary: string, lastCriticalEvent?: string): Promise<void> => {
+    if (!options?.saveExecutionCheckpoint) return;
+    const checkpointSeq = Math.max(1, turns);
+    const state: ExecutionCheckpointState = buildCheckpointState({
+      turns,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      softBudgetMode,
+      maxTokenRecoveries,
+      promptMode: promptController.getMode(),
+      summary,
+      lastCriticalEvent,
+      metadata: {
+        qualityGateRequired: qualityGate.required,
+        qualityGatePassed: qualityGate.passed,
+        qualityGateMaxRiskScore: Number(qualityGate.maxRiskScore.toFixed(3)),
+        qualityGateBlockedTransitions: qualityGate.blockedTransitions,
+      },
+      toolProgress: toolProgressState,
+      maxToolProgressEntries: 25,
+    });
+    await options.saveExecutionCheckpoint(checkpointSeq, state);
+  };
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -300,16 +360,40 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
     },
   ];
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-  let turns = 0;
+  if (shouldResume && resumeState) {
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `RESUME CONTEXT reviewer:\n` +
+            `- summary: ${resumeState.context.summary}\n` +
+            `- lastCriticalEvent: ${resumeState.context.lastCriticalEvent ?? "none"}\n` +
+            `- turns_done: ${resumeState.core.turns}\n` +
+            `Retome do ponto atual sem repetir etapas já concluídas. Priorize tool_use quando houver ação pendente.`,
+        },
+      ],
+    });
+  }
+
+  let inputTokens = shouldResume && resumeState ? resumeState.core.inputTokens : 0;
+  let outputTokens = shouldResume && resumeState ? resumeState.core.outputTokens : 0;
+  let cacheReadTokens = shouldResume && resumeState ? resumeState.core.cacheReadTokens : 0;
+  let cacheCreationTokens = shouldResume && resumeState ? resumeState.core.cacheCreationTokens : 0;
+  let turns = shouldResume && resumeState ? resumeState.core.turns : 0;
   let finalStatus = "error";
   let lastHeaders: { get(name: string): string | null } | null = null;
-  let maxTokenRecoveries = 0;
-  let softBudgetMode = false;
+  let maxTokenRecoveries = shouldResume && resumeState ? resumeState.core.maxTokenRecoveries : 0;
+  let softBudgetMode = shouldResume && resumeState ? resumeState.core.softBudgetMode : false;
   const issueCache = new Map<string, string>();
+  const toolProgressState = [...(resumeState?.toolProgress ?? [])];
+
+  if (shouldResume && resumeState) {
+    console.log(
+      `[reviewer] retomada ativa issue=${issueKey} turn=${resumeState.core.turns} mode=${resumeState.core.promptMode}`
+    );
+  }
 
   try {
     while (turns < MAX_TURNS) {
@@ -347,6 +431,7 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
         softBudgetMode,
         messages,
       });
+      qualityGate = updateQualityGateRisk(qualityGate, messages, QUALITY_GATE_RISK_THRESHOLD);
       if (modeDecision.switched && modeDecision.switchInstruction) {
         console.log(`\n[reviewer] prompt mode -> ${modeDecision.mode} (${modeDecision.reason})`);
         messages.push({
@@ -354,8 +439,16 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
           content: [{ type: "text", text: modeDecision.switchInstruction }],
         });
       }
+      if (qualityGate.enabled && qualityGate.required && !qualityGateInstructionSent) {
+        qualityGateInstructionSent = true;
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: getQualityGateInstruction("reviewer") }],
+        });
+      }
 
       if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && tokensBeforeCall >= MAX_TOTAL_TOKENS) {
+        await saveCheckpoint("Interrompido antes da chamada por hard budget.", "hard_budget_before_call");
         console.log(`\n[reviewer] orçamento hard de tokens atingido antes da chamada (${tokensBeforeCall}/${MAX_TOTAL_TOKENS}).`);
         break;
       }
@@ -413,6 +506,7 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
       }
 
       if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && totalBudgetTokens >= MAX_TOTAL_TOKENS && response.stop_reason !== "end_turn") {
+        await saveCheckpoint("Interrompido após chamada por hard budget.", "hard_budget_after_call");
         console.log(
           `\n[reviewer] orçamento hard de tokens atingido (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — encerrando com segurança.`
         );
@@ -420,12 +514,16 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
       }
 
       for (const block of response.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") {
+          process.stdout.write(block.text);
+          qualityGate = updateQualityGateEvidence(qualityGate, block.text);
+        }
         else if (block.type === "tool_use")
           console.log(`\n  [tool: ${block.name}]`);
       }
 
       if (response.stop_reason === "end_turn") {
+        await saveCheckpoint("Execução finalizada com end_turn.", "end_turn");
         finalStatus = "success";
         break;
       }
@@ -439,14 +537,66 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
         const results: Anthropic.ToolResultBlockParam[] = [];
         for (const block of response.content) {
           if (block.type === "tool_use") {
-            const result = await executeTool(block.name, block.input as Record<string, unknown>, issueCache);
+            const toolInput = block.input as Record<string, unknown>;
+            const cacheKey = getReplayCacheKey("reviewer", block.name, toolInput);
+
+            let result: string;
+            let replayed = false;
+            if (ENABLE_REPLAY_SKIP && cacheKey) {
+              const cached = toolProgressState.find(
+                (entry) => entry.cacheKey === cacheKey && entry.status === "completed" && !!entry.cachedResult
+              );
+              if (cached?.cachedResult) {
+                result = cached.cachedResult;
+                replayed = true;
+                console.log(`[reviewer] replay skip tool=${block.name} cacheKey=${cacheKey}`);
+              } else {
+                result = await executeTool(
+                  block.name,
+                  toolInput,
+                  issueCache,
+                  (statusName) => {
+                    const guarded = enforceQualityGateTransition(qualityGate, statusName, [APPROVED_STATUS, REJECTED_STATUS]);
+                    qualityGate = guarded.gate;
+                    return guarded.blocked ? guarded.message ?? "Erro: QUALITY_GATE_REQUIRED" : null;
+                  }
+                );
+              }
+            } else {
+              result = await executeTool(
+                block.name,
+                toolInput,
+                issueCache,
+                (statusName) => {
+                  const guarded = enforceQualityGateTransition(qualityGate, statusName, [APPROVED_STATUS, REJECTED_STATUS]);
+                  qualityGate = guarded.gate;
+                  return guarded.blocked ? guarded.message ?? "Erro: QUALITY_GATE_REQUIRED" : null;
+                }
+              );
+            }
+
+            if (cacheKey) {
+              const nextEntry = {
+                toolName: block.name,
+                status: (replayed ? "skipped" : "completed") as "skipped" | "completed",
+                cacheKey,
+                resultHash: `${result.length}:${result.slice(0, 64)}`,
+                cachedResult: result.length <= REPLAY_MAX_CACHED_RESULT_CHARS ? result : undefined,
+                skipReason: replayed ? "checkpoint_cache_hit" : undefined,
+                replaySource: replayed ? ("checkpoint_cache" as const) : ("live" as const),
+              };
+              upsertToolProgressState(toolProgressState, cacheKey, nextEntry);
+            }
+
             results.push({ type: "tool_result", tool_use_id: block.id, content: result });
           }
         }
         messages.push({ role: "user", content: results });
+        await saveCheckpoint("Tool chain executada; aguardando próximo turno.", "tool_use");
       } else if (response.stop_reason === "max_tokens") {
         maxTokenRecoveries++;
         if (maxTokenRecoveries > MAX_TOKEN_RECOVERIES) {
+          await saveCheckpoint("Encerrado por limite de recuperações max_tokens.", "max_tokens_recovery_limit");
           console.log(
             `\n[reviewer] limite de recuperações por max_tokens atingido (${MAX_TOKEN_RECOVERIES}) — encerrando execução.`
           );
@@ -466,8 +616,10 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
             },
           ],
         });
+        await saveCheckpoint("Recuperação por max_tokens solicitada.", "max_tokens");
         continue;
       } else {
+        await saveCheckpoint("Stop reason inesperado; execução interrompida.", `unexpected_${String(response.stop_reason)}`);
         // max_tokens ou stop_sequence — interrompe sem corromper o histórico
         console.log(`\n[reviewer] stop_reason inesperado: ${response.stop_reason}`);
         break;

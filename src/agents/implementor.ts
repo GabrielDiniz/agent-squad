@@ -16,6 +16,18 @@ import {
   resolvePromptModeSetting,
   type PromptMode,
 } from "./prompt-policy.js";
+import {
+  enforceQualityGateTransition,
+  getQualityGateInstruction,
+  getQualityGateThreshold,
+  isQualityGateEnabled,
+  updateQualityGateEvidence,
+  updateQualityGateRisk,
+  type QualityGateState,
+} from "./quality-gate.js";
+import { buildCheckpointState } from "./checkpoint-state.js";
+import { getReplayCacheKey, upsertToolProgressState } from "./replay-policy.js";
+import type { ExecutionCheckpointState } from "../queue/backend.js";
 
 const client = new Anthropic();
 const MAX_FILE_READS = 10;
@@ -35,6 +47,11 @@ const ENABLE_PROMPT_COMPACT = envFlag("IMPLEMENTOR_ENABLE_PROMPT_COMPACT", false
 const ENABLE_SNAPSHOT = envFlag("IMPLEMENTOR_ENABLE_SNAPSHOT", true);
 const ENABLE_CACHE = envFlag("IMPLEMENTOR_ENABLE_CACHE", true);
 const ENABLE_BUDGET = envFlag("IMPLEMENTOR_ENABLE_BUDGET", true);
+const ENABLE_REPLAY_SKIP =
+  envFlag("RESUME_ENABLE_REPLAY_SKIP", false) && envFlag("IMPLEMENTOR_ENABLE_REPLAY_SKIP", false);
+const REPLAY_MAX_CACHED_RESULT_CHARS = Number(process.env.IMPLEMENTOR_REPLAY_MAX_CACHED_RESULT_CHARS ?? 24000);
+const ENABLE_QUALITY_GATES = isQualityGateEnabled("IMPLEMENTOR");
+const QUALITY_GATE_RISK_THRESHOLD = getQualityGateThreshold("IMPLEMENTOR");
 
 const PROMPT_MODE_SETTING = resolvePromptModeSetting(process.env.IMPLEMENTOR_PROMPT_MODE, ENABLE_PROMPT_COMPACT);
 const PROMPT_AUTO_POLICY = getPromptAutoPolicyConfig("IMPLEMENTOR");
@@ -50,6 +67,8 @@ const ERROR_STATUS = process.env.JIRA_IMPLEMENTOR_ERROR_STATUS ?? "Pausado";
 
 export interface AgentRunOptions {
   checkpoint?: () => Promise<void>;
+  saveExecutionCheckpoint?: (checkpointSeq: number, state: ExecutionCheckpointState) => Promise<void>;
+  resumeCheckpointState?: ExecutionCheckpointState | null;
 }
 
 // ─── bash_read ────────────────────────────────────────────────────────────────
@@ -754,6 +773,17 @@ Seja fiel à especificação técnica. Siga os padrões de código existentes no
 
 async function doImplementation(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
   const promptController = new PromptModeController(PROMPT_MODE_SETTING, PROMPT_AUTO_POLICY);
+  let qualityGate: QualityGateState = {
+    enabled: ENABLE_QUALITY_GATES,
+    required: false,
+    passed: false,
+    maxRiskScore: 0,
+    blockedTransitions: 0,
+  };
+  let qualityGateInstructionSent = false;
+  const resumeState = options?.resumeCheckpointState ?? null;
+  const resumeEnabled = (process.env.IMPLEMENTOR_ENABLE_RESUME ?? process.env.RESUME_ENABLE_FUNCTIONAL ?? "0") !== "0";
+  const shouldResume = resumeEnabled && !!resumeState;
   const codebases = resolveCodebases();
 
   async function resolveCodebaseOrError(codebaseName: string): Promise<CodebaseEntry> {
@@ -809,22 +839,74 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
     },
   ];
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-  let turns = 0;
+  if (shouldResume && resumeState) {
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `RESUME CONTEXT implementor:\n` +
+            `- summary: ${resumeState.context.summary}\n` +
+            `- lastCriticalEvent: ${resumeState.context.lastCriticalEvent ?? "none"}\n` +
+            `- turns_done: ${resumeState.core.turns}\n` +
+            `Retome do ponto atual sem repetir etapas já concluídas. Priorize tool_use quando houver ação pendente.`,
+        },
+      ],
+    });
+  }
+
+  let inputTokens = shouldResume && resumeState ? resumeState.core.inputTokens : 0;
+  let outputTokens = shouldResume && resumeState ? resumeState.core.outputTokens : 0;
+  let cacheReadTokens = shouldResume && resumeState ? resumeState.core.cacheReadTokens : 0;
+  let cacheCreationTokens = shouldResume && resumeState ? resumeState.core.cacheCreationTokens : 0;
+  let turns = shouldResume && resumeState ? resumeState.core.turns : 0;
   let finalStatus = "error";
   const fileReadCount = { n: 0 };
   const fileAccessCount = new Map<string, number>(); // C+D: acessos por arquivo
   let lastHeaders: { get(name: string): string | null } | null = null;
-  let maxTokenRecoveries = 0;
-  let softBudgetMode = false;
+  let maxTokenRecoveries = shouldResume && resumeState ? resumeState.core.maxTokenRecoveries : 0;
+  let softBudgetMode = shouldResume && resumeState ? resumeState.core.softBudgetMode : false;
   let hardBudgetExceeded = false;
   let hardBudgetCommentPosted = false;
   const issueCache = new Map<string, string>();
   const codebasesCache = new Map<string, string>();
   const modulesCache = new Map<string, string>();
+  const toolProgressState = [...(resumeState?.toolProgress ?? [])];
+
+  if (shouldResume && resumeState) {
+    console.log(
+      `[implementor] retomada ativa issue=${issueKey} turn=${resumeState.core.turns} mode=${resumeState.core.promptMode}`
+    );
+  }
+
+  const saveCheckpoint = async (summary: string, lastCriticalEvent?: string): Promise<void> => {
+    if (!options?.saveExecutionCheckpoint) return;
+    const checkpointSeq = Math.max(1, turns);
+    const state: ExecutionCheckpointState = buildCheckpointState({
+      turns,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      softBudgetMode,
+      maxTokenRecoveries,
+      promptMode: promptController.getMode(),
+      summary,
+      lastCriticalEvent,
+      metadata: {
+        fileReads: fileReadCount.n,
+        uniqueFiles: fileAccessCount.size,
+        qualityGateRequired: qualityGate.required,
+        qualityGatePassed: qualityGate.passed,
+        qualityGateMaxRiskScore: Number(qualityGate.maxRiskScore.toFixed(3)),
+        qualityGateBlockedTransitions: qualityGate.blockedTransitions,
+      },
+      toolProgress: toolProgressState,
+      maxToolProgressEntries: 70,
+    });
+    await options.saveExecutionCheckpoint(checkpointSeq, state);
+  };
 
   try {
     while (turns < MAX_TURNS) {
@@ -862,6 +944,7 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
         softBudgetMode,
         messages,
       });
+      qualityGate = updateQualityGateRisk(qualityGate, messages, QUALITY_GATE_RISK_THRESHOLD);
       if (modeDecision.switched && modeDecision.switchInstruction) {
         console.log(`\n[implementor] prompt mode -> ${modeDecision.mode} (${modeDecision.reason})`);
         messages.push({
@@ -869,9 +952,17 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
           content: [{ type: "text", text: modeDecision.switchInstruction }],
         });
       }
+      if (qualityGate.enabled && qualityGate.required && !qualityGateInstructionSent) {
+        qualityGateInstructionSent = true;
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: getQualityGateInstruction("implementor") }],
+        });
+      }
 
       if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && tokensBeforeCall >= MAX_TOTAL_TOKENS) {
         hardBudgetExceeded = true;
+        await saveCheckpoint("Interrompido antes da chamada por hard budget.", "hard_budget_before_call");
         console.log(`\n[implementor] orçamento hard de tokens atingido antes da chamada (${tokensBeforeCall}/${MAX_TOTAL_TOKENS}).`);
         break;
       }
@@ -931,6 +1022,7 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
 
       if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && totalBudgetTokens >= MAX_TOTAL_TOKENS && response.stop_reason !== "end_turn") {
         hardBudgetExceeded = true;
+        await saveCheckpoint("Interrompido após chamada por hard budget.", "hard_budget_after_call");
         console.log(
           `\n[implementor] orçamento hard de tokens atingido (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — encerrando com segurança.`
         );
@@ -938,12 +1030,16 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
       }
 
       for (const block of response.content) {
-        if (block.type === "text") process.stdout.write(block.text);
+        if (block.type === "text") {
+          process.stdout.write(block.text);
+          qualityGate = updateQualityGateEvidence(qualityGate, block.text);
+        }
         else if (block.type === "tool_use")
           console.log(`\n  [tool: ${block.name}(${JSON.stringify(block.input).slice(0, 120)})]`);
       }
 
       if (response.stop_reason === "end_turn") {
+        await saveCheckpoint("Execução finalizada com end_turn.", "end_turn");
         finalStatus = "success";
         break;
       }
@@ -956,9 +1052,156 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
         for (const block of response.content) {
           if (block.type === "tool_use") {
             const inp = block.input as Record<string, unknown>;
+            const cacheKey = getReplayCacheKey("implementor", block.name, inp);
             let result: string;
+            let replayed = false;
             try {
-              if (block.name === "jira_get_issue") {
+              if (ENABLE_REPLAY_SKIP && cacheKey) {
+                const cached = toolProgressState.find(
+                  (entry) => entry.cacheKey === cacheKey && entry.status === "completed" && !!entry.cachedResult
+                );
+                if (cached?.cachedResult) {
+                  result = cached.cachedResult;
+                  replayed = true;
+                  console.log(`[implementor] replay skip tool=${block.name} cacheKey=${cacheKey}`);
+                } else if (block.name === "jira_get_issue") {
+                  const issueKeyReq = inp.issue_key as string;
+                  if (ENABLE_CACHE && issueCache.has(issueKeyReq)) {
+                    result = "Cache hit jira_get_issue: use os detalhes já retornados anteriormente nesta execução.";
+                  } else {
+                    result = await jiraGetIssue(issueKeyReq);
+                    if (ENABLE_CACHE) issueCache.set(issueKeyReq, result);
+                  }
+                } else if (block.name === "list_codebases") {
+                  const key = "list_codebases";
+                  if (ENABLE_CACHE && codebasesCache.has(key)) {
+                    result = "Cache hit list_codebases: use os repositórios já listados nesta execução.";
+                  } else {
+                    result = JSON.stringify(
+                      codebases.map((c) => ({
+                        name: c.name,
+                        description: c.description,
+                        path: c.path,
+                        repositoryUrl: c.repositoryUrl ?? null,
+                        localReady: existsSync(path.join(c.path, ".git")),
+                      })),
+                      null,
+                      2
+                    );
+                    if (ENABLE_CACHE) codebasesCache.set(key, result);
+                  }
+                } else if (block.name === "list_modules") {
+                  const entry = await resolveCodebaseOrError(inp.codebase as string);
+                  const moduleKey = String(inp.codebase);
+                  if (ENABLE_CACHE && modulesCache.has(moduleKey)) {
+                    result = `Cache hit list_modules(${moduleKey}): use os módulos já retornados nesta execução.`;
+                  } else if (!entry.modules?.length) {
+                    result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore com bash_read.`;
+                  } else {
+                    result = JSON.stringify(
+                      entry.modules.map((m) => ({
+                        name: m.name,
+                        description: m.description,
+                        keywords: m.keywords ?? [],
+                      })),
+                      null,
+                      2
+                    );
+                    if (ENABLE_CACHE) modulesCache.set(moduleKey, result);
+                  }
+                } else if (block.name === "bash_read") {
+                  await resolveCodebaseOrError(inp.codebase as string);
+                  result = execBashRead(
+                    inp.codebase as string,
+                    inp.command as string,
+                    codebases,
+                    fileReadCount,
+                    fileAccessCount
+                  );
+                } else if (block.name === "write_file") {
+                  await resolveCodebaseOrError(inp.codebase as string);
+                  result = execWriteFile(
+                    inp.codebase as string,
+                    inp.relative_path as string,
+                    inp.content as string,
+                    codebases
+                  );
+                } else if (block.name === "patch_file") {
+                  await resolveCodebaseOrError(inp.codebase as string);
+                  result = execPatchFile(
+                    inp.codebase as string,
+                    inp.relative_path as string,
+                    inp.start_line as number,
+                    inp.end_line as number,
+                    inp.content as string,
+                    codebases
+                  );
+                } else if (block.name === "bash_exec") {
+                  await resolveCodebaseOrError(inp.codebase as string);
+                  result = execBashExec(
+                    inp.codebase as string,
+                    inp.command as string,
+                    codebases
+                  );
+                } else if (block.name === "create_pull_request") {
+                  const entry = await resolveCodebaseOrError(inp.codebase as string);
+                  try {
+                    result = await createPullRequest({
+                      cwd: entry.path,
+                      title: inp.title as string,
+                      body: inp.body as string,
+                      headBranch: inp.head_branch as string,
+                      baseBranch: inp.base_branch as string,
+                    });
+                  } catch (prErr) {
+                    const errMsg = String(prErr);
+                    const branch = String(inp.head_branch ?? issueKey);
+                    const provider = (process.env.GIT_PROVIDER ?? "github").toLowerCase();
+                    const providerHints =
+                      provider === "github"
+                        ? "- Token sem escopo suficiente no GitHub (Fine-grained: Pull requests Read/Write + Contents Read/Write; Classic: repo)\\n- Token sem acesso ao repositório alvo\\n- Repositório com política que bloqueia criação de PR por API"
+                        : provider === "gitlab"
+                          ? "- GITLAB_TOKEN sem escopo api\\n- Token sem permissão no projeto (Developer/Maintainer)"
+                          : provider === "bitbucket"
+                            ? "- BITBUCKET_APP_PASSWORD sem permissão Repositories:Read/Write\\n- App password vinculado a usuário sem acesso ao repositório"
+                            : "- AZURE_DEVOPS_PAT sem escopo Code (Read & Write)\\n- PAT sem acesso ao projeto/repositório no Azure DevOps";
+
+                    const comment =
+                      `## ⚠️ Falha ao criar Pull Request\\n\\n` +
+                      `O agente implementador concluiu as alterações e fez push da branch, mas não conseguiu abrir a PR/MR automaticamente.\\n\\n` +
+                      `**Branch publicada:** \`${branch}\`\\n` +
+                      `**Codebase:** \`${String(inp.codebase ?? "(não informado)")}\`\\n\\n` +
+                      `**Erro retornado:**\\n\`\`\`\\n${errMsg}\\n\`\`\`\\n\\n` +
+                      `**Possíveis causas (${provider}):**\\n${providerHints}\\n\\n` +
+                      `**Ação recomendada:** ajustar permissões do token e reexecutar a automação, ou abrir a PR/MR manualmente para a branch \`${branch}\`.`;
+
+                    try {
+                      await jiraAddComment(issueKey, comment);
+                      console.warn(`[implementor] ${issueKey}: comentário de falha de PR postado no Jira.`);
+                    } catch (commentErr) {
+                      console.warn(`[implementor] aviso: não foi possível postar comentário de falha de PR: ${commentErr}`);
+                    }
+
+                    result = `Erro: ${errMsg}`;
+                  }
+                } else if (block.name === "jira_add_comment") {
+                  await jiraAddComment(inp.issue_key as string, inp.comment as string);
+                  result = "Comentário adicionado.";
+                } else if (block.name === "jira_transition_issue") {
+                  const guarded = enforceQualityGateTransition(qualityGate, String(inp.status_name ?? ""), [DONE_STATUS]);
+                  qualityGate = guarded.gate;
+                  if (guarded.blocked) {
+                    result = guarded.message ?? "Erro: QUALITY_GATE_REQUIRED";
+                  } else {
+                    result = await jiraTransitionToStatus(
+                      inp.issue_key as string,
+                      inp.status_name as string
+                    );
+                  }
+                } else {
+                  result = `Tool desconhecida: ${block.name}`;
+                }
+              } else if (block.name === "jira_get_issue") {
                 const issueKeyReq = inp.issue_key as string;
                 if (ENABLE_CACHE && issueCache.has(issueKeyReq)) {
                   result = "Cache hit jira_get_issue: use os detalhes já retornados anteriormente nesta execução.";
@@ -1091,10 +1334,16 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
                 result = "Comentário adicionado.";
 
               } else if (block.name === "jira_transition_issue") {
-                result = await jiraTransitionToStatus(
-                  inp.issue_key as string,
-                  inp.status_name as string
-                );
+                const guarded = enforceQualityGateTransition(qualityGate, String(inp.status_name ?? ""), [DONE_STATUS]);
+                qualityGate = guarded.gate;
+                if (guarded.blocked) {
+                  result = guarded.message ?? "Erro: QUALITY_GATE_REQUIRED";
+                } else {
+                  result = await jiraTransitionToStatus(
+                    inp.issue_key as string,
+                    inp.status_name as string
+                  );
+                }
 
               } else {
                 result = `Tool desconhecida: ${block.name}`;
@@ -1102,13 +1351,29 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
             } catch (err) {
               result = `Erro: ${String(err)}`;
             }
+
+            if (cacheKey) {
+              const nextEntry = {
+                toolName: block.name,
+                status: (replayed ? "skipped" : "completed") as "skipped" | "completed",
+                cacheKey,
+                resultHash: `${result.length}:${result.slice(0, 64)}`,
+                cachedResult: result.length <= REPLAY_MAX_CACHED_RESULT_CHARS ? result : undefined,
+                skipReason: replayed ? "checkpoint_cache_hit" : undefined,
+                replaySource: replayed ? ("checkpoint_cache" as const) : ("live" as const),
+              };
+              upsertToolProgressState(toolProgressState, cacheKey, nextEntry);
+            }
+
             results.push({ type: "tool_result", tool_use_id: block.id, content: result });
           }
         }
         messages.push({ role: "user", content: results });
+        await saveCheckpoint("Tool chain executada; aguardando próximo turno.", "tool_use");
       } else if (response.stop_reason === "max_tokens") {
         maxTokenRecoveries++;
         if (maxTokenRecoveries > MAX_TOKEN_RECOVERIES) {
+          await saveCheckpoint("Encerrado por limite de recuperações max_tokens.", "max_tokens_recovery_limit");
           console.log(
             `\n[implementor] limite de recuperações por max_tokens atingido (${MAX_TOKEN_RECOVERIES}) — encerrando execução.`
           );
@@ -1128,8 +1393,10 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
             },
           ],
         });
+        await saveCheckpoint("Recuperação por max_tokens solicitada.", "max_tokens");
         continue;
       } else {
+        await saveCheckpoint("Stop reason inesperado; execução interrompida.", `unexpected_${String(response.stop_reason)}`);
         console.log(`\n[implementor] stop_reason inesperado: ${response.stop_reason}`);
         break;
       }

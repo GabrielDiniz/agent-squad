@@ -1,4 +1,6 @@
 import mysql from "mysql2/promise";
+import { createHash } from "node:crypto";
+import { getCheckpointMaxPerJob, governCheckpointState, shouldRejectOutOfOrderCheckpoint } from "./checkpoint-governance.js";
 
 export interface TokenUsage {
   inputTokens: number;
@@ -32,6 +34,58 @@ export interface QueueJob {
   state: string;
   attempts: number;
   maxAttempts: number;
+}
+
+export interface ExecutionCheckpointState {
+  core: {
+    turns: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    softBudgetMode: boolean;
+    maxTokenRecoveries: number;
+    promptMode: "compact" | "balanced" | "deep";
+  };
+  context: {
+    summary: string;
+    snapshotText?: string;
+    lastCriticalEvent?: string;
+    metadata?: Record<string, unknown>;
+  };
+  toolProgress?: Array<{
+    toolName: string;
+    status: "completed" | "skipped" | "failed";
+    cacheKey?: string;
+    resultHash?: string;
+    cachedResult?: string;
+    validUntil?: string;
+    skipReason?: string;
+    replaySource?: "live" | "checkpoint_cache";
+  }>;
+}
+
+export interface SaveExecutionCheckpointInput {
+  jobId: number;
+  issueKey: string;
+  agentType: AgentType;
+  checkpointVersion: number;
+  checkpointSeq: number;
+  state: ExecutionCheckpointState;
+}
+
+export interface ExecutionCheckpointRecord {
+  id: number;
+  jobId: number;
+  issueKey: string;
+  agentType: AgentType;
+  checkpointVersion: number;
+  checkpointSeq: number;
+  state: ExecutionCheckpointState;
+  isValid: boolean;
+  invalidReason: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface IssueWorkStateSnapshot {
@@ -148,6 +202,23 @@ export async function dbMigrate(): Promise<void> {
       updated_at                TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_issue_locks_lease (lease_until),
       INDEX idx_issue_locks_owner (owner_worker_id, owner_job_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS agent_execution_checkpoints (
+      id                        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      job_id                    BIGINT UNSIGNED       NOT NULL,
+      issue_key                 VARCHAR(50)           NOT NULL,
+      agent_type                VARCHAR(20)           NOT NULL,
+      checkpoint_version        INT UNSIGNED          NOT NULL DEFAULT 1,
+      checkpoint_seq            INT UNSIGNED          NOT NULL,
+      state_json                JSON                  NOT NULL,
+      is_valid                  TINYINT(1)            NOT NULL DEFAULT 1,
+      invalid_reason            VARCHAR(255)          DEFAULT NULL,
+      created_at                TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at                TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_agent_checkpoint_job_seq (job_id, checkpoint_seq),
+      INDEX idx_agent_checkpoint_job_seq (job_id, checkpoint_seq),
+      INDEX idx_agent_checkpoint_issue_agent (issue_key, agent_type, created_at),
+      INDEX idx_agent_checkpoint_valid (is_valid, job_id, checkpoint_seq)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE OR REPLACE VIEW queue_jobs_overview AS
       SELECT
@@ -717,6 +788,428 @@ export async function dbReleaseCodebaseLock(
   jobId: number
 ): Promise<boolean> {
   return dbReleaseLock("codebase", codebaseName, workerId, jobId);
+}
+
+type CheckpointToolProgress = NonNullable<ExecutionCheckpointState["toolProgress"]>[number];
+
+interface CheckpointStateDelta {
+  core?: Partial<ExecutionCheckpointState["core"]>;
+  context?: Partial<ExecutionCheckpointState["context"]>;
+  toolProgress?:
+    | { mode: "append"; entries: CheckpointToolProgress[] }
+    | { mode: "replace"; entries: CheckpointToolProgress[] }
+    | { mode: "clear" };
+}
+
+interface PersistedCheckpointEnvelope {
+  format: "checkpoint_v2";
+  kind: "full" | "delta";
+  stateHash: string;
+  savedAt: string;
+  baseSeq?: number;
+  state?: ExecutionCheckpointState;
+  delta?: CheckpointStateDelta;
+  validity: {
+    hashAlgorithm: "sha256";
+    deltaApplied: boolean;
+    changedFields: string[];
+  };
+}
+
+function hashCheckpointState(state: ExecutionCheckpointState): string {
+  return createHash("sha256").update(JSON.stringify(state)).digest("hex");
+}
+
+function safeJsonParse(value: unknown): unknown {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return value;
+}
+
+function asCheckpointEnvelope(value: unknown): PersistedCheckpointEnvelope | null {
+  if (!value || typeof value !== "object") return null;
+  const maybe = value as Record<string, unknown>;
+  if (maybe.format !== "checkpoint_v2") return null;
+  if (maybe.kind !== "full" && maybe.kind !== "delta") return null;
+  if (typeof maybe.stateHash !== "string") return null;
+  if (typeof maybe.savedAt !== "string") return null;
+  if (!maybe.validity || typeof maybe.validity !== "object") return null;
+  return maybe as unknown as PersistedCheckpointEnvelope;
+}
+
+function sameToolProgressEntry(a: CheckpointToolProgress, b: CheckpointToolProgress): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function computeStateDelta(
+  previousState: ExecutionCheckpointState,
+  nextState: ExecutionCheckpointState
+): { delta: CheckpointStateDelta | null; changedFields: string[] } {
+  const changedFields: string[] = [];
+  const coreDelta: Partial<ExecutionCheckpointState["core"]> = {};
+  const contextDelta: Partial<ExecutionCheckpointState["context"]> = {};
+
+  for (const key of Object.keys(nextState.core) as Array<keyof ExecutionCheckpointState["core"]>) {
+    if (previousState.core[key] !== nextState.core[key]) {
+      (coreDelta as any)[key] = nextState.core[key];
+      changedFields.push(`core.${String(key)}`);
+    }
+  }
+
+  const contextKeys: Array<keyof ExecutionCheckpointState["context"]> = [
+    "summary",
+    "snapshotText",
+    "lastCriticalEvent",
+    "metadata",
+  ];
+  for (const key of contextKeys) {
+    const prevValue = previousState.context[key];
+    const nextValue = nextState.context[key];
+    if (JSON.stringify(prevValue) !== JSON.stringify(nextValue)) {
+      (contextDelta as any)[key] = nextValue;
+      changedFields.push(`context.${String(key)}`);
+    }
+  }
+
+  const previousProgress = previousState.toolProgress ?? [];
+  const nextProgress = nextState.toolProgress ?? [];
+  let toolProgressDelta: CheckpointStateDelta["toolProgress"] | undefined;
+
+  const equalLength = previousProgress.length === nextProgress.length;
+  const fullyEqual =
+    equalLength && previousProgress.every((entry, index) => sameToolProgressEntry(entry, nextProgress[index]!));
+
+  if (!fullyEqual) {
+    const canAppend =
+      nextProgress.length >= previousProgress.length &&
+      previousProgress.every((entry, index) => sameToolProgressEntry(entry, nextProgress[index]!));
+
+    if (canAppend && nextProgress.length > previousProgress.length) {
+      toolProgressDelta = {
+        mode: "append",
+        entries: nextProgress.slice(previousProgress.length),
+      };
+      changedFields.push("toolProgress.append");
+    } else if (nextProgress.length === 0 && previousProgress.length > 0) {
+      toolProgressDelta = { mode: "clear" };
+      changedFields.push("toolProgress.clear");
+    } else {
+      toolProgressDelta = {
+        mode: "replace",
+        entries: nextProgress,
+      };
+      changedFields.push("toolProgress.replace");
+    }
+  }
+
+  const hasCore = Object.keys(coreDelta).length > 0;
+  const hasContext = Object.keys(contextDelta).length > 0;
+  if (!hasCore && !hasContext && !toolProgressDelta) {
+    return { delta: null, changedFields: [] };
+  }
+
+  return {
+    delta: {
+      ...(hasCore ? { core: coreDelta } : {}),
+      ...(hasContext ? { context: contextDelta } : {}),
+      ...(toolProgressDelta ? { toolProgress: toolProgressDelta } : {}),
+    },
+    changedFields,
+  };
+}
+
+function applyStateDelta(baseState: ExecutionCheckpointState, delta: CheckpointStateDelta): ExecutionCheckpointState {
+  const nextState: ExecutionCheckpointState = {
+    core: {
+      ...baseState.core,
+      ...(delta.core ?? {}),
+    },
+    context: {
+      ...baseState.context,
+      ...(delta.context ?? {}),
+    },
+    toolProgress: baseState.toolProgress ? [...baseState.toolProgress] : [],
+  };
+
+  if (delta.toolProgress) {
+    if (delta.toolProgress.mode === "append") {
+      nextState.toolProgress = [...(nextState.toolProgress ?? []), ...delta.toolProgress.entries];
+    } else if (delta.toolProgress.mode === "replace") {
+      nextState.toolProgress = [...delta.toolProgress.entries];
+    } else {
+      nextState.toolProgress = [];
+    }
+  }
+
+  return nextState;
+}
+
+function decodeLegacyOrFullState(rawState: unknown): ExecutionCheckpointState | null {
+  const parsed = safeJsonParse(rawState);
+  if (!parsed || typeof parsed !== "object") return null;
+  const envelope = asCheckpointEnvelope(parsed);
+  if (envelope?.kind === "full" && envelope.state) {
+    return envelope.state;
+  }
+  const maybeState = parsed as ExecutionCheckpointState;
+  if (!maybeState.core || !maybeState.context) return null;
+  return maybeState;
+}
+
+async function reconstructCheckpointStateAtSeq(
+  p: mysql.Pool,
+  jobId: number,
+  targetSeq: number
+): Promise<ExecutionCheckpointState | null> {
+  const [rows] = await p.query<mysql.RowDataPacket[]>(
+    `SELECT checkpoint_seq, state_json
+       FROM agent_execution_checkpoints
+      WHERE job_id = ?
+        AND is_valid = 1
+        AND checkpoint_seq <= ?
+      ORDER BY checkpoint_seq ASC, id ASC`,
+    [jobId, targetSeq]
+  );
+
+  const statesBySeq = new Map<number, ExecutionCheckpointState>();
+  for (const row of rows) {
+    const seq = Number(row.checkpoint_seq);
+    const parsed = safeJsonParse(row.state_json);
+    const envelope = asCheckpointEnvelope(parsed);
+
+    if (!envelope) {
+      const legacy = decodeLegacyOrFullState(parsed);
+      if (legacy) {
+        statesBySeq.set(seq, legacy);
+      }
+      continue;
+    }
+
+    if (envelope.kind === "full") {
+      if (!envelope.state) continue;
+      if (hashCheckpointState(envelope.state) !== envelope.stateHash) continue;
+      statesBySeq.set(seq, envelope.state);
+      continue;
+    }
+
+    if (!envelope.delta || typeof envelope.baseSeq !== "number") continue;
+    const baseState = statesBySeq.get(envelope.baseSeq);
+    if (!baseState) continue;
+    const rebuilt = applyStateDelta(baseState, envelope.delta);
+    if (hashCheckpointState(rebuilt) !== envelope.stateHash) continue;
+    statesBySeq.set(seq, rebuilt);
+  }
+
+  return statesBySeq.get(targetSeq) ?? null;
+}
+
+export async function dbSaveExecutionCheckpoint(input: SaveExecutionCheckpointInput): Promise<number | null> {
+  const p = getPool();
+  if (!p) return null;
+  try {
+    const [seqRows] = await p.query<mysql.RowDataPacket[]>(
+      `SELECT MAX(checkpoint_seq) AS latest_seq
+         FROM agent_execution_checkpoints
+        WHERE job_id = ?`,
+      [input.jobId]
+    );
+    const latestSeq = Number(seqRows[0]?.latest_seq ?? 0);
+    if (shouldRejectOutOfOrderCheckpoint(latestSeq, input.checkpointSeq)) {
+      console.warn(
+        `[db] ignoring out-of-order checkpoint job=${input.jobId} seq=${input.checkpointSeq} latest_seq=${latestSeq}`
+      );
+      return null;
+    }
+
+    const governed = governCheckpointState(input.state);
+    let persistedStateJson = governed.json;
+
+    if (latestSeq > 0) {
+      const previousState = await reconstructCheckpointStateAtSeq(p, input.jobId, latestSeq);
+      if (previousState) {
+        const { delta, changedFields } = computeStateDelta(previousState, governed.state as ExecutionCheckpointState);
+        if (delta) {
+          const fullEnvelope: PersistedCheckpointEnvelope = {
+            format: "checkpoint_v2",
+            kind: "full",
+            state: governed.state as ExecutionCheckpointState,
+            stateHash: hashCheckpointState(governed.state as ExecutionCheckpointState),
+            savedAt: new Date().toISOString(),
+            validity: {
+              hashAlgorithm: "sha256",
+              deltaApplied: false,
+              changedFields,
+            },
+          };
+          const deltaEnvelope: PersistedCheckpointEnvelope = {
+            format: "checkpoint_v2",
+            kind: "delta",
+            baseSeq: latestSeq,
+            delta,
+            stateHash: hashCheckpointState(governed.state as ExecutionCheckpointState),
+            savedAt: new Date().toISOString(),
+            validity: {
+              hashAlgorithm: "sha256",
+              deltaApplied: true,
+              changedFields,
+            },
+          };
+
+          const fullJson = JSON.stringify(fullEnvelope);
+          const deltaJson = JSON.stringify(deltaEnvelope);
+          persistedStateJson = deltaJson.length < fullJson.length ? deltaJson : fullJson;
+        }
+      }
+    }
+
+    if (persistedStateJson === governed.json) {
+      const envelope: PersistedCheckpointEnvelope = {
+        format: "checkpoint_v2",
+        kind: "full",
+        state: governed.state as ExecutionCheckpointState,
+        stateHash: hashCheckpointState(governed.state as ExecutionCheckpointState),
+        savedAt: new Date().toISOString(),
+        validity: {
+          hashAlgorithm: "sha256",
+          deltaApplied: false,
+          changedFields: ["core", "context", "toolProgress"],
+        },
+      };
+      persistedStateJson = JSON.stringify(envelope);
+    }
+
+    const [result] = await p.execute<mysql.ResultSetHeader>(
+      `INSERT INTO agent_execution_checkpoints
+        (job_id, issue_key, agent_type, checkpoint_version, checkpoint_seq, state_json, is_valid)
+       VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), 1)
+       ON DUPLICATE KEY UPDATE
+         state_json = VALUES(state_json),
+         checkpoint_version = VALUES(checkpoint_version),
+         is_valid = 1,
+         invalid_reason = NULL`,
+      [
+        input.jobId,
+        input.issueKey,
+        input.agentType,
+        input.checkpointVersion,
+        input.checkpointSeq,
+        persistedStateJson,
+      ]
+    );
+
+    const maxPerJob = getCheckpointMaxPerJob();
+    if (maxPerJob > 0) {
+      await p.execute(
+        `DELETE FROM agent_execution_checkpoints
+          WHERE job_id = ?
+            AND id NOT IN (
+              SELECT id FROM (
+                SELECT id
+                  FROM agent_execution_checkpoints
+                 WHERE job_id = ?
+                 ORDER BY checkpoint_seq DESC, id DESC
+                 LIMIT ?
+              ) AS latest
+            )`,
+        [input.jobId, input.jobId, maxPerJob]
+      );
+    }
+
+    if (governed.truncated || governed.redactedFields > 0 || governed.droppedToolCachedResults > 0) {
+      console.log(
+        `[db] checkpoint governance job=${input.jobId} seq=${input.checkpointSeq}` +
+          ` truncated=${governed.truncated}` +
+          ` redacted_fields=${governed.redactedFields}` +
+          ` dropped_cached_results=${governed.droppedToolCachedResults}`
+      );
+    }
+
+    if (result.insertId && result.insertId > 0) {
+      return Number(result.insertId);
+    }
+
+    const [rows] = await p.query<mysql.RowDataPacket[]>(
+      `SELECT id
+         FROM agent_execution_checkpoints
+        WHERE job_id = ?
+          AND checkpoint_seq = ?
+        LIMIT 1`,
+      [input.jobId, input.checkpointSeq]
+    );
+    const row = rows[0];
+    return row ? Number(row.id) : null;
+  } catch (err) {
+    console.error("[db] save checkpoint error:", err);
+    return null;
+  }
+}
+
+export async function dbGetLatestExecutionCheckpoint(jobId: number): Promise<ExecutionCheckpointRecord | null> {
+  const p = getPool();
+  if (!p) return null;
+  try {
+    const [rows] = await p.query<mysql.RowDataPacket[]>(
+      `SELECT id, job_id, issue_key, agent_type, checkpoint_version, checkpoint_seq,
+              state_json, is_valid, invalid_reason, created_at, updated_at
+         FROM agent_execution_checkpoints
+        WHERE job_id = ?
+          AND is_valid = 1
+        ORDER BY checkpoint_seq DESC, id DESC
+        LIMIT 1`,
+      [jobId]
+    );
+    const row = rows[0];
+    if (!row) return null;
+
+    const checkpointSeq = Number(row.checkpoint_seq);
+    const parsedState = await reconstructCheckpointStateAtSeq(p, jobId, checkpointSeq);
+    if (!parsedState) {
+      console.warn(`[db] checkpoint reconstruction failed job=${jobId} seq=${checkpointSeq}`);
+      return null;
+    }
+
+    return {
+      id: Number(row.id),
+      jobId: Number(row.job_id),
+      issueKey: String(row.issue_key),
+      agentType: row.agent_type as AgentType,
+      checkpointVersion: Number(row.checkpoint_version),
+      checkpointSeq,
+      state: parsedState,
+      isValid: Number(row.is_valid) === 1,
+      invalidReason: row.invalid_reason == null ? null : String(row.invalid_reason),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  } catch (err) {
+    console.error("[db] load checkpoint error:", err);
+    return null;
+  }
+}
+
+export async function dbInvalidateExecutionCheckpointsByJob(jobId: number, reason: string): Promise<number> {
+  const p = getPool();
+  if (!p) return 0;
+  try {
+    const [result] = await p.execute<mysql.ResultSetHeader>(
+      `UPDATE agent_execution_checkpoints
+          SET is_valid = 0,
+              invalid_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = ?
+          AND is_valid = 1`,
+      [reason.slice(0, 255), jobId]
+    );
+    return Number(result.affectedRows ?? 0);
+  } catch (err) {
+    console.error("[db] invalidate checkpoint error:", err);
+    return 0;
+  }
 }
 
 // ─── Session lifecycle ────────────────────────────────────────────────────────

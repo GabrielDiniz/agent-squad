@@ -25,6 +25,64 @@ export interface QueueJobRecord {
   maxAttempts: number;
 }
 
+export interface CheckpointCoreState {
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  softBudgetMode: boolean;
+  maxTokenRecoveries: number;
+  promptMode: "compact" | "balanced" | "deep";
+}
+
+export interface CheckpointContextState {
+  summary: string;
+  snapshotText?: string;
+  lastCriticalEvent?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CheckpointToolProgress {
+  toolName: string;
+  status: "completed" | "skipped" | "failed";
+  cacheKey?: string;
+  resultHash?: string;
+  cachedResult?: string;
+  validUntil?: string;
+  skipReason?: string;
+  replaySource?: "live" | "checkpoint_cache";
+}
+
+export interface ExecutionCheckpointState {
+  core: CheckpointCoreState;
+  context: CheckpointContextState;
+  toolProgress?: CheckpointToolProgress[];
+}
+
+export interface SaveExecutionCheckpointInput {
+  jobId: number;
+  issueKey: string;
+  agentType: AgentType;
+  checkpointVersion: number;
+  checkpointSeq: number;
+  state: ExecutionCheckpointState;
+}
+
+export interface ExecutionCheckpointRecord {
+  id: number;
+  jobId: number;
+  issueKey: string;
+  agentType: AgentType;
+  checkpointVersion: number;
+  checkpointSeq: number;
+  state: ExecutionCheckpointState;
+  isValid: boolean;
+  invalidReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface QueueBackend {
   enqueueJob(input: EnqueueInput): Promise<EnqueueResult>;
   claimNextJob(workerId: string, leaseMs: number): Promise<QueueJobRecord | null>;
@@ -36,6 +94,9 @@ export interface QueueBackend {
   isJobSuperseded(issueKey: string, eventVersion: number): Promise<boolean>;
   markJobStale(jobId: number, workerId: string, reason: string): Promise<boolean>;
   markJobCancelled(jobId: number, workerId: string, reason: string): Promise<boolean>;
+  saveExecutionCheckpoint(input: SaveExecutionCheckpointInput): Promise<number | null>;
+  getLatestExecutionCheckpoint(jobId: number): Promise<ExecutionCheckpointRecord | null>;
+  invalidateExecutionCheckpoints(jobId: number, reason: string): Promise<number>;
 }
 
 export interface LockBackend {

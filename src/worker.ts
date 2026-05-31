@@ -3,7 +3,9 @@ import {
   type QueueJobRecord,
   type QueueBackend,
   type LockBackend,
+  type ExecutionCheckpointState,
 } from "./queue/backend.js";
+import { isCheckpointVersionCompatible } from "./checkpoint-governance.js";
 import { reviewIssue } from "./agents/reviewer.js";
 import { analyzeIssue } from "./agents/analyst.js";
 import { implementIssue } from "./agents/implementor.js";
@@ -25,6 +27,16 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.floor(n);
+}
+
+function getRehydrateTimeoutMs(agentType: QueueJobRecord["agentType"]): number {
+  const perAgent =
+    agentType === "reviewer"
+      ? process.env.REVIEWER_REHYDRATE_TIMEOUT_MS
+      : agentType === "analyst"
+        ? process.env.ANALYST_REHYDRATE_TIMEOUT_MS
+        : process.env.IMPLEMENTOR_REHYDRATE_TIMEOUT_MS;
+  return parsePositiveInt(perAgent ?? process.env.RESUME_REHYDRATE_TIMEOUT_MS, 3000);
 }
 
 export function classifyJobError(err: unknown): ErrorClass {
@@ -62,20 +74,34 @@ export function computeRetryDelayMs(
   return Math.min(maxMs, Math.floor(exp * jitter));
 }
 
-async function runAgentForJob(job: QueueJobRecord, checkpoint?: () => Promise<void>): Promise<void> {
+async function runAgentForJob(
+  job: QueueJobRecord,
+  checkpoint?: () => Promise<void>,
+  saveExecutionCheckpoint?: (checkpointSeq: number, state: ExecutionCheckpointState) => Promise<void>,
+  resumeCheckpointState?: ExecutionCheckpointState | null
+): Promise<void> {
   if (job.agentType === "reviewer") {
-    await reviewIssue(job.issueKey, { checkpoint });
+    await reviewIssue(job.issueKey, { checkpoint, saveExecutionCheckpoint, resumeCheckpointState });
     return;
   }
   if (job.agentType === "analyst") {
-    await analyzeIssue(job.issueKey, { checkpoint });
+    await analyzeIssue(job.issueKey, { checkpoint, saveExecutionCheckpoint, resumeCheckpointState });
     return;
   }
   if (job.agentType === "implementor") {
-    await implementIssue(job.issueKey, { checkpoint });
+    await implementIssue(job.issueKey, { checkpoint, saveExecutionCheckpoint, resumeCheckpointState });
     return;
   }
   throw new Error(`agent_type invalido para job ${job.id}: ${job.agentType}`);
+}
+
+function isFunctionalResumeEnabledForAgent(agentType: QueueJobRecord["agentType"]): boolean {
+  const functionalResumeEnabled = (process.env.RESUME_ENABLE_FUNCTIONAL ?? "0") !== "0";
+  if (!functionalResumeEnabled) return false;
+  if (agentType === "reviewer") return (process.env.REVIEWER_ENABLE_RESUME ?? "0") !== "0";
+  if (agentType === "analyst") return (process.env.ANALYST_ENABLE_RESUME ?? "0") !== "0";
+  if (agentType === "implementor") return (process.env.IMPLEMENTOR_ENABLE_RESUME ?? "0") !== "0";
+  return false;
 }
 
 function resolveCodebaseLockKey(job: QueueJobRecord): string | null {
@@ -98,6 +124,11 @@ async function checkJobCheckpoint(
   const currentState = await queue.getJobState(job.id);
   if (currentState === "cancelled") {
     await queue.markJobCancelled(job.id, workerId, `Cancelled cooperatively at ${stage}`);
+    try {
+      await queue.invalidateExecutionCheckpoints(job.id, `checkpoint_invalidated_by_cancelled:${stage}`);
+    } catch (err) {
+      console.warn(`[worker] job=${job.id} falha ao invalidar checkpoints após cancelamento:`, err);
+    }
     console.warn(`[worker] job=${job.id} cancelled at checkpoint=${stage}`);
     return "cancelled";
   }
@@ -105,6 +136,11 @@ async function checkJobCheckpoint(
   const superseded = await queue.isJobSuperseded(job.issueKey, job.eventVersion);
   if (superseded) {
     await queue.markJobStale(job.id, workerId, `Superseded by newer event at ${stage}`);
+    try {
+      await queue.invalidateExecutionCheckpoints(job.id, `checkpoint_invalidated_by_superseded:${stage}`);
+    } catch (err) {
+      console.warn(`[worker] job=${job.id} falha ao invalidar checkpoints após supersedência:`, err);
+    }
     console.warn(`[worker] job=${job.id} stale at checkpoint=${stage}`);
     return "stale";
   }
@@ -166,14 +202,142 @@ export async function processClaimedJob(
   }, heartbeatEveryMs);
 
   try {
+    const checkpointLoadEnabled = (process.env.RESUME_ENABLE_CHECKPOINT_LOAD ?? "1") !== "0";
+    let latestCheckpointState: ExecutionCheckpointState | null = null;
+    let checkpointLoadAttempted = false;
+    let checkpointLoadHit = false;
+    let checkpointLoadFailed = false;
+    let checkpointLoadMs = 0;
+    let checkpointVersionMismatch = false;
+    let checkpointSaveAttempts = 0;
+    let checkpointSaveSuccess = 0;
+    let checkpointSaveFailed = 0;
+    let checkpointSaveCompensated = false;
+
+    if (checkpointLoadEnabled) {
+      checkpointLoadAttempted = true;
+      const loadStartedAt = Date.now();
+      const rehydrateTimeoutMs = getRehydrateTimeoutMs(job.agentType);
+      try {
+        const latestCheckpoint = await Promise.race([
+          queue.getLatestExecutionCheckpoint(job.id),
+          new Promise<null>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`rehydrate_timeout_ms_${rehydrateTimeoutMs}`)), rehydrateTimeoutMs);
+          }),
+        ]);
+        checkpointLoadMs = Date.now() - loadStartedAt;
+        if (latestCheckpoint) {
+          if (isCheckpointVersionCompatible(latestCheckpoint.checkpointVersion)) {
+            latestCheckpointState = latestCheckpoint.state;
+            checkpointLoadHit = true;
+            console.log(
+              `[worker] job=${job.id} checkpoint encontrado seq=${latestCheckpoint.checkpointSeq} version=${latestCheckpoint.checkpointVersion} loadMs=${checkpointLoadMs}`
+            );
+          } else {
+            checkpointVersionMismatch = true;
+            try {
+              await queue.invalidateExecutionCheckpoints(
+                job.id,
+                `checkpoint_version_incompatible:${latestCheckpoint.checkpointVersion}`
+              );
+            } catch (err) {
+              console.warn(`[worker] job=${job.id} falha ao invalidar checkpoint incompatível:`, err);
+            }
+            console.warn(
+              `[worker] job=${job.id} checkpoint incompatível version=${latestCheckpoint.checkpointVersion} (fallback cold start)`
+            );
+          }
+        } else {
+          console.log(`[worker] job=${job.id} sem checkpoint valido (cold start) loadMs=${checkpointLoadMs}`);
+        }
+      } catch (err) {
+        checkpointLoadMs = Date.now() - loadStartedAt;
+        checkpointLoadFailed = true;
+        console.warn(`[worker] job=${job.id} falha ao carregar checkpoint (fallback cold start) loadMs=${checkpointLoadMs}:`, err);
+      }
+    }
+
     await runCheckpointOrThrow(job, config.workerId, "before-run", queue);
 
     console.log(
       `[worker] processing job=${job.id} issue=${job.issueKey} agent=${job.agentType} attempt=${job.attempts}/${job.maxAttempts}`
     );
+
+    const checkpointSaveEnabled = (process.env.RESUME_ENABLE_CHECKPOINT_SAVE ?? "1") !== "0";
+    const checkpointVersionRaw = Number(process.env.RESUME_CHECKPOINT_VERSION ?? 1);
+    const checkpointVersion = Number.isFinite(checkpointVersionRaw)
+      ? Math.max(1, Math.floor(checkpointVersionRaw))
+      : 1;
+
+    const saveExecutionCheckpoint = checkpointSaveEnabled
+      ? async (checkpointSeq: number, state: ExecutionCheckpointState): Promise<void> => {
+          checkpointSaveAttempts++;
+          try {
+            await queue.saveExecutionCheckpoint({
+              jobId: job.id,
+              issueKey: job.issueKey,
+              agentType: job.agentType,
+              checkpointVersion,
+              checkpointSeq,
+              state,
+            });
+            checkpointSaveSuccess++;
+          } catch (err) {
+            checkpointSaveFailed++;
+            console.warn(`[worker] job=${job.id} falha ao salvar checkpoint seq=${checkpointSeq}:`, err);
+            if (!checkpointSaveCompensated) {
+              try {
+                await queue.invalidateExecutionCheckpoints(
+                  job.id,
+                  `checkpoint_save_failed_mid_run:seq=${checkpointSeq}`
+                );
+                checkpointSaveCompensated = true;
+                console.warn(
+                  `[worker] job=${job.id} checkpoints invalidados por compensação após falha de save seq=${checkpointSeq}`
+                );
+              } catch (invalidateErr) {
+                console.warn(
+                  `[worker] job=${job.id} falha na compensação após erro de save checkpoint seq=${checkpointSeq}:`,
+                  invalidateErr
+                );
+              }
+            }
+          }
+        }
+      : undefined;
+
+    const resumeFeatureEnabledForJob = isFunctionalResumeEnabledForAgent(job.agentType);
+    const resumeCheckpointState = resumeFeatureEnabledForJob
+      ? latestCheckpointState
+      : null;
+
+    const resumeAttempts = resumeFeatureEnabledForJob ? 1 : 0;
+    const resumeSuccess = resumeCheckpointState ? 1 : 0;
+    const resumeFallback = resumeFeatureEnabledForJob && !resumeCheckpointState ? 1 : 0;
+    const turnsSkipped = resumeCheckpointState?.core.turns ?? 0;
+    const toolsSkipped =
+      resumeCheckpointState?.toolProgress?.filter((entry) => entry.status === "skipped").length ?? 0;
+    const resumeTokensSavedEstimate = resumeCheckpointState
+      ? resumeCheckpointState.core.inputTokens +
+        resumeCheckpointState.core.outputTokens +
+        resumeCheckpointState.core.cacheReadTokens +
+        resumeCheckpointState.core.cacheCreationTokens
+      : 0;
+
     await runAgentForJob(job, async () => {
       await runCheckpointOrThrow(job, config.workerId, "between-turns", queue);
-    });
+    }, saveExecutionCheckpoint, resumeCheckpointState);
+
+    console.log(
+      `[worker] checkpoint-metrics job=${job.id} load_attempted=${checkpointLoadAttempted}` +
+        ` load_hit=${checkpointLoadHit} load_failed=${checkpointLoadFailed} load_ms=${checkpointLoadMs}` +
+        ` version_mismatch=${checkpointVersionMismatch}` +
+        ` save_attempts=${checkpointSaveAttempts} save_success=${checkpointSaveSuccess} save_failed=${checkpointSaveFailed}` +
+        ` save_compensated=${checkpointSaveCompensated}` +
+        ` resume_attempts=${resumeAttempts} resume_success=${resumeSuccess} resume_fallback=${resumeFallback}` +
+        ` turns_skipped=${turnsSkipped} tools_skipped=${toolsSkipped}` +
+        ` resume_tokens_saved_estimate=${resumeTokensSavedEstimate}`
+    );
 
     await runCheckpointOrThrow(job, config.workerId, "after-run", queue);
 
