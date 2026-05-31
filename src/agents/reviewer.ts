@@ -3,6 +3,13 @@ import { dbInsertSession, dbUpdateSession, dbFinishSession, type TokenUsage } fr
 import { jiraGetIssue, jiraAddComment, jiraTransitionToStatus } from "../jira.js";
 import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
+import {
+  envFlag,
+  getPromptAutoPolicyConfig,
+  PromptModeController,
+  resolvePromptModeSetting,
+  type PromptMode,
+} from "./prompt-policy.js";
 
 const client = new Anthropic();
 
@@ -14,6 +21,25 @@ const MODEL =
   process.env.CLAUDE_MODEL_REVIEWER ??
   process.env.CLAUDE_MODEL ??
   "claude-haiku-4-5-20251001";
+
+const MAX_TURNS = Number(process.env.REVIEWER_MAX_TURNS ?? 10);
+const MAX_TOKENS_PER_TURN = Number(process.env.REVIEWER_MAX_TOKENS_PER_TURN ?? 1536);
+const MAX_TOKEN_RECOVERIES = Number(process.env.REVIEWER_MAX_TOKEN_RECOVERIES ?? 3);
+const MAX_TOTAL_TOKENS = Number(process.env.REVIEWER_MAX_TOTAL_TOKENS ?? 12000);
+const SOFT_BUDGET_RATIO = Number(process.env.REVIEWER_SOFT_BUDGET_RATIO ?? 0.8);
+const SOFT_MAX_TOKENS_PER_TURN = Number(
+  process.env.REVIEWER_SOFT_MAX_TOKENS_PER_TURN ?? Math.max(256, Math.floor(MAX_TOKENS_PER_TURN * 0.6))
+);
+const SNAPSHOT_INTERVAL = Number(process.env.REVIEWER_SNAPSHOT_INTERVAL ?? 6);
+const MAX_HISTORY_MESSAGES = Number(process.env.REVIEWER_MAX_HISTORY_MESSAGES ?? 24);
+
+const ENABLE_PROMPT_COMPACT = envFlag("REVIEWER_ENABLE_PROMPT_COMPACT", false);
+const ENABLE_SNAPSHOT = envFlag("REVIEWER_ENABLE_SNAPSHOT", true);
+const ENABLE_CACHE = envFlag("REVIEWER_ENABLE_CACHE", true);
+const ENABLE_BUDGET = envFlag("REVIEWER_ENABLE_BUDGET", true);
+
+const PROMPT_MODE_SETTING = resolvePromptModeSetting(process.env.REVIEWER_PROMPT_MODE, ENABLE_PROMPT_COMPACT);
+const PROMPT_AUTO_POLICY = getPromptAutoPolicyConfig("REVIEWER");
 
 // 3 tools com schema mínimo — ~300 tokens de overhead (vs ~9k do mcp-atlassian)
 const TOOLS: Anthropic.Tool[] = [
@@ -50,7 +76,7 @@ const TOOLS: Anthropic.Tool[] = [
       required: ["issue_key", "status_name"],
     },
     // Ponto 1 de cache: definições de tools são estáticas — cache na última tool
-    cache_control: { type: "ephemeral" } as any,
+    ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
   },
 ];
 
@@ -58,9 +84,21 @@ export interface AgentRunOptions {
   checkpoint?: () => Promise<void>;
 }
 
-async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
+async function executeTool(
+  name: string,
+  input: Record<string, unknown>,
+  issueCache: Map<string, string>
+): Promise<string> {
   try {
-    if (name === "jira_get_issue") return await jiraGetIssue(input.issue_key as string);
+    if (name === "jira_get_issue") {
+      const issueKey = input.issue_key as string;
+      if (ENABLE_CACHE && issueCache.has(issueKey)) {
+        return "Cache hit jira_get_issue: use os detalhes já retornados anteriormente nesta execução.";
+      }
+      const payload = await jiraGetIssue(issueKey);
+      if (ENABLE_CACHE) issueCache.set(issueKey, payload);
+      return payload;
+    }
     if (name === "jira_add_comment") {
       await jiraAddComment(input.issue_key as string, input.comment as string);
       return "Comentário adicionado.";
@@ -74,7 +112,60 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   }
 }
 
-function buildPrompt(issueKey: string): string {
+function buildPrompt(issueKey: string, mode: PromptMode): string {
+  if (mode === "compact") {
+    return `Você é um revisor de histórias de usuário (POP-REQ-001).
+Avalie a demanda ${issueKey} com postura colaborativa e objetiva.
+
+Passos:
+1. Buscar issue no Jira.
+2. Avaliar com nota 0–10 os critérios e pesos:
+   - formato da história (20%)
+   - clareza do título (15%)
+   - critérios de aceitação (30%)
+   - escopo/INVEST (15%)
+   - valor de negócio (15%)
+   - informações de apoio (5%)
+3. Calcular média ponderada.
+   - média >= 6: APROVADO -> comentar notas/sugestões relevantes e transitar para "${APPROVED_STATUS}".
+   - média < 6: REPROVADO -> comentar lacunas prioritárias, exemplo de correção e transitar para "${REJECTED_STATUS}".
+
+Quando precisar de ação, responda com tool_use diretamente (sem explicação longa).
+Use Markdown no comentário e não repita contexto desnecessário.`;
+  }
+
+  if (mode === "deep") {
+    return `Você é um revisor de histórias de usuário (POP-REQ-001) para demandas potencialmente complexas.
+Demanda alvo: ${issueKey}.
+
+Objetivo:
+- maximizar precisão da avaliação sem desperdiçar tokens.
+
+Fluxo obrigatório:
+1. Buscar issue no Jira.
+2. Construir diagnóstico por critério (0-10) com evidências curtas do texto do issue:
+   - formato da história (20%)
+   - clareza do título (15%)
+   - critérios de aceitação (30%)
+   - escopo/INVEST (15%)
+   - valor de negócio (15%)
+   - informações de apoio (5%)
+3. Se houver ambiguidade relevante, explicitar suposição mínima antes da nota.
+4. Calcular média ponderada final.
+5. Decisão:
+   - média >= 6 -> APROVADO; comentar de forma curta e transitar para "${APPROVED_STATUS}".
+   - média < 6 -> REPROVADO; comentar gaps prioritários por peso, exemplo de correção do ponto crítico e transitar para "${REJECTED_STATUS}".
+
+Regras de eficiência:
+- priorize tool_use sempre que houver ação pendente;
+- evite repetir contexto já processado;
+- texto livre somente para decisão final e de forma concisa.
+
+Formato do comentário:
+- Markdown com seções curtas;
+- inclua: nota final, notas por critério, próximos ajustes objetivos.`;
+  }
+
   return `Você é um revisor de histórias de usuário que segue o POP-REQ-001 da empresa.
 Sua postura é CONSTRUTIVA e MODERADA — dê o benefício da dúvida quando o item estiver parcialmente atendido.
 Intenção clara vale mais do que ausência de formalismo.
@@ -121,6 +212,11 @@ Intenção clara vale mais do que ausência de formalismo.
 
 Tom do comentário: colaborativo, não punitivo. O objetivo é ajudar o analista a melhorar a história.
 
+Regras de eficiência:
+- quando precisar de ação, priorize apenas tool_use;
+- evite repetir conteúdo já processado;
+- mantenha respostas textuais objetivas.
+
 Formate o comentário em **Markdown** (será convertido automaticamente para Jira):
 use ## para seções, **negrito** para destaques, - para listas e \`código\` quando necessário.`;
 }
@@ -150,13 +246,57 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
   }
 }
 
+function isToolResultMessage(msg: Anthropic.MessageParam | undefined): boolean {
+  if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) return false;
+  return msg.content.some((block: any) => block?.type === "tool_result");
+}
+
+function compactHistory(
+  messages: Anthropic.MessageParam[],
+  snapshotText: string
+): void {
+  if (messages.length <= MAX_HISTORY_MESSAGES) return;
+
+  const tailStart = Math.max(1, messages.length - (MAX_HISTORY_MESSAGES - 2));
+  const tail = messages.slice(tailStart);
+
+  // Remove possível tool_result órfão no início do recorte
+  while (tail.length > 0 && isToolResultMessage(tail[0])) {
+    tail.shift();
+  }
+
+  const snapshot: Anthropic.MessageParam = {
+    role: "user",
+    content: [{ type: "text", text: snapshotText }],
+  };
+
+  messages.splice(1, messages.length - 1, snapshot, ...tail);
+}
+
+function getTotalBudgetTokens(
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number
+): number {
+  return inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+}
+
 async function doReview(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
+  const promptController = new PromptModeController(PROMPT_MODE_SETTING, PROMPT_AUTO_POLICY);
+
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
       // Ponto 2 de cache: prompt inicial é fixo por issue — cache para reutilizar
       // em retries e qualquer re-execução da mesma issue.
-      content: [{ type: "text", text: buildPrompt(issueKey), cache_control: { type: "ephemeral" } as any }],
+      content: [
+        {
+          type: "text",
+          text: buildPrompt(issueKey, promptController.getMode()),
+          ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
+        },
+      ],
     },
   ];
 
@@ -167,9 +307,12 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
   let turns = 0;
   let finalStatus = "error";
   let lastHeaders: { get(name: string): string | null } | null = null;
+  let maxTokenRecoveries = 0;
+  let softBudgetMode = false;
+  const issueCache = new Map<string, string>();
 
   try {
-    while (turns < 10) {
+    while (turns < MAX_TURNS) {
       if (options?.checkpoint) {
         await options.checkpoint();
       }
@@ -178,12 +321,53 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
       }
       turns++;
 
-      applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      if (ENABLE_SNAPSHOT && turns > 1 && turns % SNAPSHOT_INTERVAL === 0) {
+        compactHistory(
+          messages,
+          `SNAPSHOT reviewer: turn=${turns}; tokens_in=${inputTokens}; tokens_out=${outputTokens}; ` +
+            `continue do estado atual sem repetir conteúdo já processado.`
+        );
+      }
+
+      if (ENABLE_CACHE) {
+        applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      }
+
+      const tokensBeforeCall = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+
+      const modeDecision = promptController.decide({
+        turns,
+        totalBudgetTokens: tokensBeforeCall,
+        maxTotalTokens: MAX_TOTAL_TOKENS,
+        softBudgetMode,
+        messages,
+      });
+      if (modeDecision.switched && modeDecision.switchInstruction) {
+        console.log(`\n[reviewer] prompt mode -> ${modeDecision.mode} (${modeDecision.reason})`);
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: modeDecision.switchInstruction }],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && tokensBeforeCall >= MAX_TOTAL_TOKENS) {
+        console.log(`\n[reviewer] orçamento hard de tokens atingido antes da chamada (${tokensBeforeCall}/${MAX_TOTAL_TOKENS}).`);
+        break;
+      }
+
+      const currentMaxTokensPerTurn = ENABLE_BUDGET && softBudgetMode
+        ? Math.min(MAX_TOKENS_PER_TURN, SOFT_MAX_TOKENS_PER_TURN)
+        : MAX_TOKENS_PER_TURN;
 
       const { data: response, response: httpResponse } =
         await client.messages.create({
           model: MODEL,
-          max_tokens: 4096,
+          max_tokens: currentMaxTokensPerTurn,
           tools: TOOLS,
           messages,
         }).withResponse();
@@ -202,6 +386,39 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
         void dbUpdateSession(rowId, turns, calculateCostUsd(MODEL, usage), usage);
       }
 
+      const totalBudgetTokens = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+      const softLimitTokens = Math.floor(MAX_TOTAL_TOKENS * SOFT_BUDGET_RATIO);
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && !softBudgetMode && totalBudgetTokens >= softLimitTokens) {
+        softBudgetMode = true;
+        console.log(
+          `\n[reviewer] orçamento soft ativado (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — modo econômico.`
+        );
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "MODO ECONÔMICO ATIVO: seja ultraobjetivo e priorize apenas tool_use quando houver ação pendente. " +
+                "Evite explicações longas e não repita conteúdo já processado.",
+            },
+          ],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && totalBudgetTokens >= MAX_TOTAL_TOKENS && response.stop_reason !== "end_turn") {
+        console.log(
+          `\n[reviewer] orçamento hard de tokens atingido (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — encerrando com segurança.`
+        );
+        break;
+      }
+
       for (const block of response.content) {
         if (block.type === "text") process.stdout.write(block.text);
         else if (block.type === "tool_use")
@@ -214,6 +431,7 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
       }
 
       if (response.stop_reason === "tool_use") {
+        maxTokenRecoveries = 0;
         // Só adiciona o par (assistant + tool_results) quando o stop_reason é tool_use,
         // evitando mensagens sem tool_result correspondente (causa do 400)
         messages.push({ role: "assistant", content: response.content });
@@ -221,12 +439,19 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
         const results: Anthropic.ToolResultBlockParam[] = [];
         for (const block of response.content) {
           if (block.type === "tool_use") {
-            const result = await executeTool(block.name, block.input as Record<string, unknown>);
+            const result = await executeTool(block.name, block.input as Record<string, unknown>, issueCache);
             results.push({ type: "tool_result", tool_use_id: block.id, content: result });
           }
         }
         messages.push({ role: "user", content: results });
       } else if (response.stop_reason === "max_tokens") {
+        maxTokenRecoveries++;
+        if (maxTokenRecoveries > MAX_TOKEN_RECOVERIES) {
+          console.log(
+            `\n[reviewer] limite de recuperações por max_tokens atingido (${MAX_TOKEN_RECOVERIES}) — encerrando execução.`
+          );
+          break;
+        }
         // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
         // priorizando tool_use para evitar novo estouro por texto longo.
         messages.push({
@@ -252,7 +477,8 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
     console.log(
       `\n[reviewer] ${issueKey} — status: ${finalStatus} | turnos: ${turns}` +
         ` | tokens in: ${inputTokens} out: ${outputTokens}` +
-        ` cache_read: ${cacheReadTokens} cache_write: ${cacheCreationTokens}`
+        ` cache_read: ${cacheReadTokens} cache_write: ${cacheCreationTokens}` +
+        ` | prompt_mode: ${promptController.getMode()} switches: ${promptController.getSwitches()}`
     );
 
     if (rowId !== null) {

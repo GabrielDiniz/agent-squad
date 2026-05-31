@@ -9,10 +9,35 @@ import { calculateCostUsd } from "../cost.js";
 import { buildAuthenticatedUrl, createPullRequest } from "../git.js";
 import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
 import { ensureCodebaseCloned } from "../repository.js";
+import {
+  envFlag,
+  getPromptAutoPolicyConfig,
+  PromptModeController,
+  resolvePromptModeSetting,
+  type PromptMode,
+} from "./prompt-policy.js";
 
 const client = new Anthropic();
 const MAX_FILE_READS = 10;
-const MAX_OUTPUT_CHARS = 12_000; // aumentado: arquivos PHP/JRXML grandes precisam de mais espaço
+const MAX_OUTPUT_CHARS = Number(process.env.IMPLEMENTOR_MAX_OUTPUT_CHARS ?? 5000);
+const MAX_TURNS = Number(process.env.IMPLEMENTOR_MAX_TURNS ?? 40);
+const MAX_TOKENS_PER_TURN = Number(process.env.IMPLEMENTOR_MAX_TOKENS_PER_TURN ?? 3072);
+const MAX_TOKEN_RECOVERIES = Number(process.env.IMPLEMENTOR_MAX_TOKEN_RECOVERIES ?? 3);
+const MAX_TOTAL_TOKENS = Number(process.env.IMPLEMENTOR_MAX_TOTAL_TOKENS ?? 70000);
+const SOFT_BUDGET_RATIO = Number(process.env.IMPLEMENTOR_SOFT_BUDGET_RATIO ?? 0.8);
+const SOFT_MAX_TOKENS_PER_TURN = Number(
+  process.env.IMPLEMENTOR_SOFT_MAX_TOKENS_PER_TURN ?? Math.max(384, Math.floor(MAX_TOKENS_PER_TURN * 0.6))
+);
+const SNAPSHOT_INTERVAL = Number(process.env.IMPLEMENTOR_SNAPSHOT_INTERVAL ?? 6);
+const MAX_HISTORY_MESSAGES = Number(process.env.IMPLEMENTOR_MAX_HISTORY_MESSAGES ?? 30);
+
+const ENABLE_PROMPT_COMPACT = envFlag("IMPLEMENTOR_ENABLE_PROMPT_COMPACT", false);
+const ENABLE_SNAPSHOT = envFlag("IMPLEMENTOR_ENABLE_SNAPSHOT", true);
+const ENABLE_CACHE = envFlag("IMPLEMENTOR_ENABLE_CACHE", true);
+const ENABLE_BUDGET = envFlag("IMPLEMENTOR_ENABLE_BUDGET", true);
+
+const PROMPT_MODE_SETTING = resolvePromptModeSetting(process.env.IMPLEMENTOR_PROMPT_MODE, ENABLE_PROMPT_COMPACT);
+const PROMPT_AUTO_POLICY = getPromptAutoPolicyConfig("IMPLEMENTOR");
 // Modelo específico do agente → global → default (sonnet: geração de código completo)
 const MODEL =
   process.env.CLAUDE_MODEL_IMPLEMENTOR ??
@@ -542,7 +567,7 @@ O restante do arquivo é preservado integralmente.`,
       required: ["issue_key", "status_name"],
     },
     // Ponto 1 de cache: definições de tools são estáticas — cache na última tool
-    cache_control: { type: "ephemeral" } as any,
+    ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
   },
 ];
 
@@ -571,9 +596,83 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
   }
 }
 
+function isToolResultMessage(msg: Anthropic.MessageParam | undefined): boolean {
+  if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) return false;
+  return msg.content.some((block: any) => block?.type === "tool_result");
+}
+
+function compactHistory(messages: Anthropic.MessageParam[], snapshotText: string): void {
+  if (messages.length <= MAX_HISTORY_MESSAGES) return;
+
+  const tailStart = Math.max(1, messages.length - (MAX_HISTORY_MESSAGES - 2));
+  const tail = messages.slice(tailStart);
+  while (tail.length > 0 && isToolResultMessage(tail[0])) tail.shift();
+
+  const snapshot: Anthropic.MessageParam = {
+    role: "user",
+    content: [{ type: "text", text: snapshotText }],
+  };
+
+  messages.splice(1, messages.length - 1, snapshot, ...tail);
+}
+
+function getTotalBudgetTokens(
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number
+): number {
+  return inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+}
+
 // ─── Prompt ───────────────────────────────────────────────────────────────────
 
-function buildPrompt(issueKey: string): string {
+function buildPrompt(issueKey: string, mode: PromptMode): string {
+  if (mode === "compact") {
+    return `Você é um engenheiro de software sênior.
+Implemente a demanda ${issueKey} seguindo a especificação técnica do Jira.
+
+Passos:
+1. Buscar issue e usar technical_spec como fonte principal.
+2. Ler apenas trechos necessários (grep/rg + sed -n), com foco em arquivos da spec.
+3. Criar branch ${issueKey}, implementar mudanças sem escopo extra.
+4. Commitar em Conventional Commit, push e abrir PR/MR com create_pull_request.
+5. Transitar issue para "${DONE_STATUS}".
+
+Se houver erro de clone/acesso, comentar no Jira e encerrar.
+Não use gh pr create; use create_pull_request.
+Quando precisar agir, responda com tool_use diretamente.`;
+  }
+
+  if (mode === "deep") {
+    return `Você é um engenheiro de software sênior para demandas de implementação complexas.
+Demanda alvo: ${issueKey}.
+
+Objetivo:
+- entregar implementação correta com mínimo retrabalho e baixo consumo de tokens.
+
+Fluxo obrigatório:
+1. Buscar issue no Jira e usar technical_spec como fonte primária.
+2. Elaborar plano curto por etapas (ordem de arquivos, dependências e risco de regressão).
+3. Ler apenas trechos necessários com rg/grep + sed -n.
+4. Implementar incrementalmente com patch_file (ou write_file só para arquivos novos/pequenos).
+5. Após mudanças, preparar commit no padrão Conventional Commits.
+6. Publicar branch ${issueKey}, abrir PR/MR via create_pull_request e transitar para "${DONE_STATUS}".
+
+Regras de eficiência:
+- priorize tool_use quando houver ação;
+- evite releitura/reedição redundante;
+- evite texto narrativo longo.
+
+Regras de robustez técnica:
+- preserve padrões e contratos existentes;
+- identifique impactos cruzados antes de editar;
+- em caso de dúvida de escopo, siga estritamente a technical_spec.
+
+Se houver erro de clone/acesso, comentar no Jira e encerrar.
+Não use gh pr create; use create_pull_request.`;
+  }
+
   return `Você é um engenheiro de software sênior. Implemente a demanda ${issueKey} do Jira seguindo rigorosamente a especificação técnica elaborada pelo analista.
 
 ## Passos obrigatórios
@@ -643,12 +742,18 @@ Se ao tentar acessar qualquer codebase (list_modules, bash_read, write_file, pat
    - Orientação para corrigir e re-enfileirar a demanda
 2. Não tente prosseguir com a implementação sem o código — encerre após postar o comentário.
 
+Regras de eficiência:
+- quando houver ação pendente, priorize tool_use;
+- minimize texto descritivo durante execução;
+- evite repetir contexto já confirmado.
+
 Seja fiel à especificação técnica. Siga os padrões de código existentes no projeto.`;
 }
 
 // ─── Agentic loop ─────────────────────────────────────────────────────────────
 
 async function doImplementation(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
+  const promptController = new PromptModeController(PROMPT_MODE_SETTING, PROMPT_AUTO_POLICY);
   const codebases = resolveCodebases();
 
   async function resolveCodebaseOrError(codebaseName: string): Promise<CodebaseEntry> {
@@ -694,7 +799,13 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
     {
       role: "user",
       // Ponto 2 de cache: prompt inicial fixo por issue
-      content: [{ type: "text", text: buildPrompt(issueKey), cache_control: { type: "ephemeral" } as any }],
+      content: [
+        {
+          type: "text",
+          text: buildPrompt(issueKey, promptController.getMode()),
+          ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
+        },
+      ],
     },
   ];
 
@@ -707,9 +818,16 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
   const fileReadCount = { n: 0 };
   const fileAccessCount = new Map<string, number>(); // C+D: acessos por arquivo
   let lastHeaders: { get(name: string): string | null } | null = null;
+  let maxTokenRecoveries = 0;
+  let softBudgetMode = false;
+  let hardBudgetExceeded = false;
+  let hardBudgetCommentPosted = false;
+  const issueCache = new Map<string, string>();
+  const codebasesCache = new Map<string, string>();
+  const modulesCache = new Map<string, string>();
 
   try {
-    while (turns < 40) {
+    while (turns < MAX_TURNS) {
       if (options?.checkpoint) {
         await options.checkpoint();
       }
@@ -718,12 +836,54 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
       }
       turns++;
 
-      applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      if (ENABLE_SNAPSHOT && turns > 1 && turns % SNAPSHOT_INTERVAL === 0) {
+        compactHistory(
+          messages,
+          `SNAPSHOT implementor: turn=${turns}; tokens_in=${inputTokens}; tokens_out=${outputTokens}; ` +
+            `file_reads=${fileReadCount.n}; continue do estado atual sem repetir conteúdo.`
+        );
+      }
+
+      if (ENABLE_CACHE) {
+        applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      }
+
+      const tokensBeforeCall = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+
+      const modeDecision = promptController.decide({
+        turns,
+        totalBudgetTokens: tokensBeforeCall,
+        maxTotalTokens: MAX_TOTAL_TOKENS,
+        softBudgetMode,
+        messages,
+      });
+      if (modeDecision.switched && modeDecision.switchInstruction) {
+        console.log(`\n[implementor] prompt mode -> ${modeDecision.mode} (${modeDecision.reason})`);
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: modeDecision.switchInstruction }],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && tokensBeforeCall >= MAX_TOTAL_TOKENS) {
+        hardBudgetExceeded = true;
+        console.log(`\n[implementor] orçamento hard de tokens atingido antes da chamada (${tokensBeforeCall}/${MAX_TOTAL_TOKENS}).`);
+        break;
+      }
+
+      const currentMaxTokensPerTurn = ENABLE_BUDGET && softBudgetMode
+        ? Math.min(MAX_TOKENS_PER_TURN, SOFT_MAX_TOKENS_PER_TURN)
+        : MAX_TOKENS_PER_TURN;
 
       const { data: response, response: httpResponse } =
         await client.messages.create({
           model: MODEL,
-          max_tokens: 8192,
+          max_tokens: currentMaxTokensPerTurn,
           tools: TOOLS,
           messages,
         }).withResponse();
@@ -743,6 +903,40 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
         void dbUpdateSession(rowId, turns, calculateCostUsd(MODEL, usage), usage, codebaseNames);
       }
 
+      const totalBudgetTokens = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+      const softLimitTokens = Math.floor(MAX_TOTAL_TOKENS * SOFT_BUDGET_RATIO);
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && !softBudgetMode && totalBudgetTokens >= softLimitTokens) {
+        softBudgetMode = true;
+        console.log(
+          `\n[implementor] orçamento soft ativado (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — modo econômico.`
+        );
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "MODO ECONÔMICO ATIVO: seja ultraobjetivo e priorize apenas tool_use quando houver ação pendente. " +
+                "Evite explicações longas e não repita conteúdo já processado.",
+            },
+          ],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && totalBudgetTokens >= MAX_TOTAL_TOKENS && response.stop_reason !== "end_turn") {
+        hardBudgetExceeded = true;
+        console.log(
+          `\n[implementor] orçamento hard de tokens atingido (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — encerrando com segurança.`
+        );
+        break;
+      }
+
       for (const block of response.content) {
         if (block.type === "text") process.stdout.write(block.text);
         else if (block.type === "tool_use")
@@ -755,6 +949,7 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
       }
 
       if (response.stop_reason === "tool_use") {
+        maxTokenRecoveries = 0;
         messages.push({ role: "assistant", content: response.content });
 
         const results: Anthropic.ToolResultBlockParam[] = [];
@@ -764,24 +959,39 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
             let result: string;
             try {
               if (block.name === "jira_get_issue") {
-                result = await jiraGetIssue(inp.issue_key as string);
+                const issueKeyReq = inp.issue_key as string;
+                if (ENABLE_CACHE && issueCache.has(issueKeyReq)) {
+                  result = "Cache hit jira_get_issue: use os detalhes já retornados anteriormente nesta execução.";
+                } else {
+                  result = await jiraGetIssue(issueKeyReq);
+                  if (ENABLE_CACHE) issueCache.set(issueKeyReq, result);
+                }
 
               } else if (block.name === "list_codebases") {
-                result = JSON.stringify(
-                  codebases.map((c) => ({
-                    name: c.name,
-                    description: c.description,
-                    path: c.path,
-                    repositoryUrl: c.repositoryUrl ?? null,
-                    localReady: existsSync(path.join(c.path, ".git")),
-                  })),
-                  null,
-                  2
-                );
+                const cacheKey = "list_codebases";
+                if (ENABLE_CACHE && codebasesCache.has(cacheKey)) {
+                  result = "Cache hit list_codebases: use os repositórios já listados nesta execução.";
+                } else {
+                  result = JSON.stringify(
+                    codebases.map((c) => ({
+                      name: c.name,
+                      description: c.description,
+                      path: c.path,
+                      repositoryUrl: c.repositoryUrl ?? null,
+                      localReady: existsSync(path.join(c.path, ".git")),
+                    })),
+                    null,
+                    2
+                  );
+                  if (ENABLE_CACHE) codebasesCache.set(cacheKey, result);
+                }
 
               } else if (block.name === "list_modules") {
                 const entry = await resolveCodebaseOrError(inp.codebase as string);
-                if (!entry.modules?.length) {
+                const moduleKey = String(inp.codebase);
+                if (ENABLE_CACHE && modulesCache.has(moduleKey)) {
+                  result = `Cache hit list_modules(${moduleKey}): use os módulos já retornados nesta execução.`;
+                } else if (!entry.modules?.length) {
                   result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore com bash_read.`;
                 } else {
                   result = JSON.stringify(
@@ -793,6 +1003,7 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
                     null,
                     2
                   );
+                  if (ENABLE_CACHE) modulesCache.set(moduleKey, result);
                 }
 
               } else if (block.name === "bash_read") {
@@ -896,6 +1107,13 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
         }
         messages.push({ role: "user", content: results });
       } else if (response.stop_reason === "max_tokens") {
+        maxTokenRecoveries++;
+        if (maxTokenRecoveries > MAX_TOKEN_RECOVERIES) {
+          console.log(
+            `\n[implementor] limite de recuperações por max_tokens atingido (${MAX_TOKEN_RECOVERIES}) — encerrando execução.`
+          );
+          break;
+        }
         // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
         // priorizando tool_use para evitar novo estouro por texto longo.
         messages.push({
@@ -917,11 +1135,27 @@ async function doImplementation(issueKey: string, rowId: number | null, options?
       }
     }
   } finally {
+    if (ENABLE_BUDGET && hardBudgetExceeded && !hardBudgetCommentPosted) {
+      const comment =
+        `## ⚠️ Execução interrompida por orçamento de tokens\n\n` +
+        `O agente implementador interrompeu a execução ao atingir o limite hard de tokens configurado.\n\n` +
+        `**Limite configurado:** \`${MAX_TOTAL_TOKENS}\` tokens\n` +
+        `**Ação recomendada:** aumentar os limites \`IMPLEMENTOR_MAX_TOTAL_TOKENS\`/\`IMPLEMENTOR_MAX_TOKENS_PER_TURN\` ` +
+        `ou reexecutar a demanda para continuidade.`;
+      try {
+        await jiraAddComment(issueKey, comment);
+        hardBudgetCommentPosted = true;
+      } catch (err) {
+        console.warn(`[implementor] aviso: não foi possível postar comentário de orçamento hard: ${err}`);
+      }
+    }
+
     console.log(
       `\n[implementor] ${issueKey} — status: ${finalStatus} | turnos: ${turns}` +
         ` | tokens in: ${inputTokens} out: ${outputTokens}` +
         ` cache_read: ${cacheReadTokens} cache_write: ${cacheCreationTokens}` +
-        ` | file_reads: ${fileReadCount.n}/${MAX_FILE_READS} unique_files: ${fileAccessCount.size}`
+        ` | file_reads: ${fileReadCount.n}/${MAX_FILE_READS} unique_files: ${fileAccessCount.size}` +
+        ` | prompt_mode: ${promptController.getMode()} switches: ${promptController.getSwitches()}`
     );
 
     // ── Transição de erro: sinaliza que o agente parou sem concluir ──────────

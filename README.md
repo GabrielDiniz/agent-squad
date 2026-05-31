@@ -152,6 +152,62 @@ Checklist rápido para operação:
 4. Confirmar credenciais de Git provider para push/PR.
 5. Acompanhar filas e custos pelas tabelas/views.
 
+## 8.1 Rollout da otimização de tokens (Fase 19)
+
+Feature flags por agente (todas em `.env`):
+
+- `*_ENABLE_PROMPT_COMPACT`
+- `*_PROMPT_MODE=auto|compact|balanced|deep`
+- `*_PROMPT_AUTO_COOLDOWN_TURNS`
+- `*_PROMPT_AUTO_MIN_TURNS_FOR_DEEP`
+- `*_PROMPT_AUTO_DEEP_COMPLEXITY_THRESHOLD`
+- `*_PROMPT_AUTO_DEEP_BUDGET_CEILING`
+- `*_PROMPT_AUTO_COMPACT_BUDGET_THRESHOLD`
+- `*_PROMPT_AUTO_MAX_SWITCHES`
+- `*_ENABLE_SNAPSHOT`
+- `*_ENABLE_CACHE`
+- `*_ENABLE_BUDGET`
+
+Uso recomendado de `*_PROMPT_MODE`:
+
+- `auto`: padrão recomendado para produção (seleção dinâmica por contexto + pressão de orçamento).
+- `compact`: menor custo, instruções enxutas para demandas simples/repetitivas.
+- `balanced`: fixo, equilíbrio entre custo e qualidade.
+- `deep`: melhor cobertura para demandas complexas (mais validações e planejamento técnico).
+
+Regras do modo `auto`:
+
+- promove para `deep` quando a complexidade contextual aumenta e o orçamento ainda está folgado;
+- reduz para `compact` ao entrar em pressão de orçamento (soft/hard) para preservar continuidade;
+- aplica cooldown/histerese para evitar troca excessiva de modo no meio da execução.
+
+Ordem recomendada de rollout:
+
+1. `reviewer`
+2. `analyst`
+3. `implementor`
+
+Procedimento por etapa:
+
+1. Ativar flags apenas do agente alvo.
+2. Executar por janela curta (ex.: 10-20 issues) e comparar métricas.
+3. Validar: taxa de sucesso, latência média, custo por issue e taxa de `max_tokens`.
+4. Avançar para o próximo agente somente se não houver degradação relevante.
+
+Critérios de rollback imediato:
+
+- queda de taxa de sucesso > 5%
+- aumento de latência média > 20%
+- aumento de erros de tool chain (`tool_use`/`tool_result` inconsistente)
+- aumento de interrupções por orçamento hard sem conclusão operacional
+
+Passos de rollback:
+
+1. Desativar no agente afetado: `*_ENABLE_PROMPT_COMPACT=0`, `*_ENABLE_SNAPSHOT=0`, `*_ENABLE_CACHE=0`, `*_ENABLE_BUDGET=0`.
+2. Reiniciar serviço/containers.
+3. Reprocessar apenas issues impactadas.
+4. Registrar incidente com causa e ajuste de limites.
+
 ## 9. Scripts uteis
 
 - `npm run dev`

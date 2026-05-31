@@ -31,6 +31,7 @@ Atualizado em: 2026-05-30
 17. [16 - Locks de Issue e Codebase](done/phases/16-locks-issue-codebase.md)
 18. [17 - Cancelamento, Supersedencia e Ordem](done/phases/17-cancelamento-supersedencia-ordem.md)
 19. [18 - Abstracao de Backend e Migracao para Redis](done/phases/18-abstracao-backend-migracao-redis.md)
+20. [19 - Otimizacao de Tokens e Ciclos dos Agentes](done/phases/19-otimizacao-tokens-ciclos-agentes.md)
 
 ## To-dos concluidos por fase
 
@@ -44,16 +45,23 @@ Atualizado em: 2026-05-30
 4. Atualize este indice movendo a fase para "Em andamento".
 5. Ao concluir, mova para [backlog/done/phases](done/phases) e [backlog/done/todos](done/todos).
 
-## Iniciativa ativa
+## Iniciativa concluida 01
 
 - Objetivo: remover dependência de volumes externos para codebase.
 - Estratégia: descoberta por URL de repositório + clone automático antes da tarefa.
 - Status: concluída.
 - Tracking: fases 07 a 11 em [backlog/done/phases](done/phases) com TODOs em [backlog/done/todos](done/todos).
 
-## Nova iniciativa
+## Iniciativa concluida 02
 
 - Objetivo: introduzir fila de trabalho com workers e locks transacionais para evitar interferencia entre agentes.
 - Estratégia: fila e locks via tabelas SQL, com camada de abstração para migração futura para Redis.
 - Status: concluída.
 - Tracking: fases 12 a 18 em [backlog/done/phases](done/phases) com TODOs em [backlog/done/todos](done/todos).
+
+## Iniciativa concluida 03
+
+- Objetivo: reduzir consumo de tokens e ciclos por execução dos agentes, mantendo qualidade de saída e robustez operacional.
+- Estratégia: prompt enxuto, modo tool-first, budget de tokens, sumarização incremental e cache por issue.
+- Status: concluída.
+- Tracking: fase 19 em [backlog/done/phases/19-otimizacao-tokens-ciclos-agentes.md](done/phases/19-otimizacao-tokens-ciclos-agentes.md) com TODO em [backlog/done/todos/19-otimizacao-tokens-ciclos-agentes/TODO.md](done/todos/19-otimizacao-tokens-ciclos-agentes/TODO.md).

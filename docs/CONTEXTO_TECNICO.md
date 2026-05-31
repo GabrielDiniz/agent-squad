@@ -254,3 +254,38 @@ Diretrizes de migracao:
 - Persistencia: `src/db.ts`
 - Agentes: `src/agents/reviewer.ts`, `src/agents/analyst.ts`, `src/agents/implementor.ts`
 - SQL: `db/init.sql`, `db/migrate_queue_workers.sql`, `db/migrate_add_tokens.sql`
+
+## 13. Rollout e rollback da Fase 19
+
+### 13.1 Feature flags por mecanismo
+
+Cada agente possui quatro chaves de controle independentes:
+
+- Prompt compacto: `*_ENABLE_PROMPT_COMPACT`
+- Sumarização incremental: `*_ENABLE_SNAPSHOT`
+- Cache por execução: `*_ENABLE_CACHE`
+- Budget hard/soft: `*_ENABLE_BUDGET`
+
+As flags permitem rollback granular por agente e por mecanismo sem alterar código.
+
+### 13.2 Ordem de rollout
+
+1. `reviewer` (menor risco operacional)
+2. `analyst` (risco médio)
+3. `implementor` (maior risco por escrita/Git/PR)
+
+### 13.3 Critérios objetivos de rollback
+
+Efetuar rollback se houver qualquer condição abaixo por janela de observação:
+
+- taxa de sucesso cair mais de 5%
+- latência média aumentar mais de 20%
+- aumento de falhas de cadeia `tool_use`/`tool_result`
+- interrupções por orçamento hard sem conclusão operacional aceitável
+
+### 13.4 Procedimento de rollback
+
+1. Desativar as flags no agente afetado (`*_ENABLE_* = 0`).
+2. Reiniciar processo/containers para aplicar configuração.
+3. Reenfileirar apenas issues impactadas.
+4. Registrar evidências (logs, métricas, delta antes/depois) e ajustar limites.

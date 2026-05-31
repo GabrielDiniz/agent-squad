@@ -8,6 +8,13 @@ import { withRateLimit, interTurnDelay } from "../retry.js";
 import { calculateCostUsd } from "../cost.js";
 import { resolveCodebases, type CodebaseEntry } from "../codebases.js";
 import { ensureCodebaseCloned } from "../repository.js";
+import {
+  envFlag,
+  getPromptAutoPolicyConfig,
+  PromptModeController,
+  resolvePromptModeSetting,
+  type PromptMode,
+} from "./prompt-policy.js";
 
 const client = new Anthropic();
 
@@ -19,7 +26,25 @@ const MODEL =
 
 const MAX_FILE_READS = 5;
 const DONE_STATUS = process.env.JIRA_ANALYST_DONE_STATUS ?? "Pronto para Começar";
-const MAX_OUTPUT_CHARS = 4_000;
+const MAX_OUTPUT_CHARS = Number(process.env.ANALYST_MAX_OUTPUT_CHARS ?? 3000);
+const MAX_TURNS = Number(process.env.ANALYST_MAX_TURNS ?? 25);
+const MAX_TOKENS_PER_TURN = Number(process.env.ANALYST_MAX_TOKENS_PER_TURN ?? 1536);
+const MAX_TOKEN_RECOVERIES = Number(process.env.ANALYST_MAX_TOKEN_RECOVERIES ?? 3);
+const MAX_TOTAL_TOKENS = Number(process.env.ANALYST_MAX_TOTAL_TOKENS ?? 40000);
+const SOFT_BUDGET_RATIO = Number(process.env.ANALYST_SOFT_BUDGET_RATIO ?? 0.8);
+const SOFT_MAX_TOKENS_PER_TURN = Number(
+  process.env.ANALYST_SOFT_MAX_TOKENS_PER_TURN ?? Math.max(256, Math.floor(MAX_TOKENS_PER_TURN * 0.6))
+);
+const SNAPSHOT_INTERVAL = Number(process.env.ANALYST_SNAPSHOT_INTERVAL ?? 6);
+const MAX_HISTORY_MESSAGES = Number(process.env.ANALYST_MAX_HISTORY_MESSAGES ?? 28);
+
+const ENABLE_PROMPT_COMPACT = envFlag("ANALYST_ENABLE_PROMPT_COMPACT", false);
+const ENABLE_SNAPSHOT = envFlag("ANALYST_ENABLE_SNAPSHOT", true);
+const ENABLE_CACHE = envFlag("ANALYST_ENABLE_CACHE", true);
+const ENABLE_BUDGET = envFlag("ANALYST_ENABLE_BUDGET", true);
+
+const PROMPT_MODE_SETTING = resolvePromptModeSetting(process.env.ANALYST_PROMPT_MODE, ENABLE_PROMPT_COMPACT);
+const PROMPT_AUTO_POLICY = getPromptAutoPolicyConfig("ANALYST");
 
 const TOOLS: Anthropic.Tool[] = [
   {
@@ -108,7 +133,7 @@ const TOOLS: Anthropic.Tool[] = [
       required: ["issue_key", "status_name"],
     },
     // Ponto 1 de cache: definições de tools são estáticas — cache na última tool
-    cache_control: { type: "ephemeral" } as any,
+    ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
   },
 ];
 
@@ -198,7 +223,53 @@ function execBashRead(
   }
 }
 
-function buildPrompt(issueKey: string): string {
+function buildPrompt(issueKey: string, mode: PromptMode): string {
+  if (mode === "compact") {
+    return `Você é um analista técnico sênior.
+Analise a demanda ${issueKey} e produza solução técnica objetiva.
+
+Passos:
+1. Buscar issue no Jira.
+2. Identificar codebases relevantes com list_codebases.
+3. Identificar módulos relevantes com list_modules.
+4. Explorar código com preferência por grep/rg + sed -n (evite leituras completas desnecessárias).
+5. Elaborar proposta técnica em Markdown com: resumo, módulos/codebases, arquivos a alterar/criar, passos de implementação e riscos/testes.
+6. Preencher o campo técnico (jira_update_field) e transitar para "${DONE_STATUS}".
+
+Se houver erro de clone/autenticação/acesso, comentar no Jira via jira_add_comment e encerrar.
+Quando precisar agir, responda com tool_use diretamente.`;
+  }
+
+  if (mode === "deep") {
+   return `Você é um analista técnico sênior para demandas de maior complexidade.
+Demanda alvo: ${issueKey}.
+
+Objetivo:
+- produzir solução técnica implementável, com baixo retrabalho e uso eficiente de tokens.
+
+Fluxo obrigatório:
+1. Buscar issue no Jira.
+2. Delimitar escopo técnico: contexto, restrições e pontos de dúvida.
+3. Mapear codebases/módulos relevantes com list_codebases/list_modules.
+4. Investigar código em camadas:
+  - localização (rg/grep)
+  - leitura seletiva (sed -n)
+  - evidências dos pontos de mudança.
+5. Para cada mudança proposta, explicitar:
+  - impacto funcional
+  - impacto técnico (dependências/integrações)
+  - risco principal e mitigação.
+6. Publicar technical spec em Markdown via jira_update_field.
+7. Transitar issue para "${DONE_STATUS}".
+
+Regras de eficiência:
+- use tool_use sempre que houver ação pendente;
+- evite releitura redundante de arquivos;
+- prefira saídas curtas e estruturadas.
+
+Se houver erro de acesso/clone, comentar no Jira imediatamente e encerrar a execução.`;
+  }
+
   return `Você é um analista técnico sênior. Analise a demanda ${issueKey} do Jira e proponha uma solução técnica para a equipe de desenvolvimento.
 
 ## Passos obrigatórios
@@ -243,6 +314,11 @@ Se ao tentar acessar qualquer codebase (list_modules, bash_read) ocorrer um erro
 Seja específico: cite nomes de classes, métodos, rotas e padrões já adotados no projeto.
 Tom: técnico e direto. Escreva em português.
 
+Regras de eficiência:
+- quando houver ação pendente, priorize tool_use;
+- reduza texto narrativo sem perda de precisão técnica;
+- não repita contexto já consolidado.
+
 Formate o comentário em **Markdown** (será convertido automaticamente para Jira):
 use ## para seções, **negrito** para destaques, - para listas, 1. para listas numeradas e \`\`\`php para blocos de código.`;
 }
@@ -270,7 +346,37 @@ function applyRollingCache(messages: Anthropic.MessageParam[]): void {
   }
 }
 
+function isToolResultMessage(msg: Anthropic.MessageParam | undefined): boolean {
+  if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) return false;
+  return msg.content.some((block: any) => block?.type === "tool_result");
+}
+
+function compactHistory(messages: Anthropic.MessageParam[], snapshotText: string): void {
+  if (messages.length <= MAX_HISTORY_MESSAGES) return;
+
+  const tailStart = Math.max(1, messages.length - (MAX_HISTORY_MESSAGES - 2));
+  const tail = messages.slice(tailStart);
+  while (tail.length > 0 && isToolResultMessage(tail[0])) tail.shift();
+
+  const snapshot: Anthropic.MessageParam = {
+    role: "user",
+    content: [{ type: "text", text: snapshotText }],
+  };
+
+  messages.splice(1, messages.length - 1, snapshot, ...tail);
+}
+
+function getTotalBudgetTokens(
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number
+): number {
+  return inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+}
+
 async function doAnalysis(issueKey: string, rowId: number | null, options?: AgentRunOptions): Promise<void> {
+  const promptController = new PromptModeController(PROMPT_MODE_SETTING, PROMPT_AUTO_POLICY);
   const codebases = resolveCodebases();
   async function resolveCodebaseOrError(codebaseName: string): Promise<CodebaseEntry> {
     const entry = codebases.find((c) => c.name === codebaseName);
@@ -308,7 +414,13 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
     {
       role: "user",
       // Ponto 2 de cache: prompt inicial fixo por issue
-      content: [{ type: "text", text: buildPrompt(issueKey), cache_control: { type: "ephemeral" } as any }],
+      content: [
+        {
+          type: "text",
+          text: buildPrompt(issueKey, promptController.getMode()),
+          ...(ENABLE_CACHE ? { cache_control: { type: "ephemeral" } as any } : {}),
+        },
+      ],
     },
   ];
 
@@ -321,9 +433,16 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
   const fileReadCount = { n: 0 };
   const fileAccessCount = new Map<string, number>(); // C+D: acessos por arquivo
   let lastHeaders: { get(name: string): string | null } | null = null;
+  let maxTokenRecoveries = 0;
+  let softBudgetMode = false;
+  let hardBudgetExceeded = false;
+  let hardBudgetCommentPosted = false;
+  const issueCache = new Map<string, string>();
+  const codebasesCache = new Map<string, string>();
+  const modulesCache = new Map<string, string>();
 
   try {
-    while (turns < 25) {
+    while (turns < MAX_TURNS) {
       if (options?.checkpoint) {
         await options.checkpoint();
       }
@@ -332,12 +451,54 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
       }
       turns++;
 
-      applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      if (ENABLE_SNAPSHOT && turns > 1 && turns % SNAPSHOT_INTERVAL === 0) {
+        compactHistory(
+          messages,
+          `SNAPSHOT analyst: turn=${turns}; tokens_in=${inputTokens}; tokens_out=${outputTokens}; ` +
+            `file_reads=${fileReadCount.n}; continue do estado atual sem repetir conteúdo.`
+        );
+      }
+
+      if (ENABLE_CACHE) {
+        applyRollingCache(messages); // Ponto 3: marca último user-block para cache
+      }
+
+      const tokensBeforeCall = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+
+      const modeDecision = promptController.decide({
+        turns,
+        totalBudgetTokens: tokensBeforeCall,
+        maxTotalTokens: MAX_TOTAL_TOKENS,
+        softBudgetMode,
+        messages,
+      });
+      if (modeDecision.switched && modeDecision.switchInstruction) {
+        console.log(`\n[analyst] prompt mode -> ${modeDecision.mode} (${modeDecision.reason})`);
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: modeDecision.switchInstruction }],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && tokensBeforeCall >= MAX_TOTAL_TOKENS) {
+        hardBudgetExceeded = true;
+        console.log(`\n[analyst] orçamento hard de tokens atingido antes da chamada (${tokensBeforeCall}/${MAX_TOTAL_TOKENS}).`);
+        break;
+      }
+
+      const currentMaxTokensPerTurn = ENABLE_BUDGET && softBudgetMode
+        ? Math.min(MAX_TOKENS_PER_TURN, SOFT_MAX_TOKENS_PER_TURN)
+        : MAX_TOKENS_PER_TURN;
 
       const { data: response, response: httpResponse } =
         await client.messages.create({
           model: MODEL,
-          max_tokens: 4096,
+          max_tokens: currentMaxTokensPerTurn,
           tools: TOOLS,
           messages,
         }).withResponse();
@@ -357,6 +518,40 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
         void dbUpdateSession(rowId, turns, calculateCostUsd(MODEL, usage), usage, codebaseNames);
       }
 
+      const totalBudgetTokens = getTotalBudgetTokens(
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheCreationTokens
+      );
+      const softLimitTokens = Math.floor(MAX_TOTAL_TOKENS * SOFT_BUDGET_RATIO);
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && !softBudgetMode && totalBudgetTokens >= softLimitTokens) {
+        softBudgetMode = true;
+        console.log(
+          `\n[analyst] orçamento soft ativado (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — modo econômico.`
+        );
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "MODO ECONÔMICO ATIVO: seja ultraobjetivo e priorize apenas tool_use quando houver ação pendente. " +
+                "Evite explicações longas e não repita conteúdo já processado.",
+            },
+          ],
+        });
+      }
+
+      if (ENABLE_BUDGET && MAX_TOTAL_TOKENS > 0 && totalBudgetTokens >= MAX_TOTAL_TOKENS && response.stop_reason !== "end_turn") {
+        hardBudgetExceeded = true;
+        console.log(
+          `\n[analyst] orçamento hard de tokens atingido (${totalBudgetTokens}/${MAX_TOTAL_TOKENS}) — encerrando com segurança.`
+        );
+        break;
+      }
+
       for (const block of response.content) {
         if (block.type === "text") process.stdout.write(block.text);
         else if (block.type === "tool_use")
@@ -369,6 +564,7 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
       }
 
       if (response.stop_reason === "tool_use") {
+        maxTokenRecoveries = 0;
         messages.push({ role: "assistant", content: response.content });
 
         const results: Anthropic.ToolResultBlockParam[] = [];
@@ -378,22 +574,37 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
             let result: string;
             try {
               if (block.name === "jira_get_issue") {
-                result = await jiraGetIssue(inp.issue_key as string);
+                const issueKeyReq = inp.issue_key as string;
+                if (ENABLE_CACHE && issueCache.has(issueKeyReq)) {
+                  result = "Cache hit jira_get_issue: use os detalhes já retornados anteriormente nesta execução.";
+                } else {
+                  result = await jiraGetIssue(issueKeyReq);
+                  if (ENABLE_CACHE) issueCache.set(issueKeyReq, result);
+                }
               } else if (block.name === "list_codebases") {
-                result = JSON.stringify(
-                  codebases.map((c) => ({
-                    name: c.name,
-                    description: c.description,
-                    path: c.path,
-                    repositoryUrl: c.repositoryUrl ?? null,
-                    localReady: existsSync(path.join(c.path, ".git")),
-                  })),
-                  null,
-                  2
-                );
+                const cacheKey = "list_codebases";
+                if (ENABLE_CACHE && codebasesCache.has(cacheKey)) {
+                  result = "Cache hit list_codebases: use os repositórios já listados nesta execução.";
+                } else {
+                  result = JSON.stringify(
+                    codebases.map((c) => ({
+                      name: c.name,
+                      description: c.description,
+                      path: c.path,
+                      repositoryUrl: c.repositoryUrl ?? null,
+                      localReady: existsSync(path.join(c.path, ".git")),
+                    })),
+                    null,
+                    2
+                  );
+                  if (ENABLE_CACHE) codebasesCache.set(cacheKey, result);
+                }
               } else if (block.name === "list_modules") {
                 const entry = await resolveCodebaseOrError(inp.codebase as string);
-                if (!entry.modules?.length) {
+                const moduleKey = String(inp.codebase);
+                if (ENABLE_CACHE && modulesCache.has(moduleKey)) {
+                  result = `Cache hit list_modules(${moduleKey}): use os módulos já retornados nesta execução.`;
+                } else if (!entry.modules?.length) {
                   result = `Codebase "${inp.codebase}" não possui módulos definidos. Explore diretamente com bash_read.`;
                 } else {
                   result = JSON.stringify(
@@ -405,6 +616,7 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
                     null,
                     2
                   );
+                  if (ENABLE_CACHE) modulesCache.set(moduleKey, result);
                 }
               } else if (block.name === "bash_read") {
                 await resolveCodebaseOrError(inp.codebase as string);
@@ -439,6 +651,13 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
         }
         messages.push({ role: "user", content: results });
       } else if (response.stop_reason === "max_tokens") {
+        maxTokenRecoveries++;
+        if (maxTokenRecoveries > MAX_TOKEN_RECOVERIES) {
+          console.log(
+            `\n[analyst] limite de recuperações por max_tokens atingido (${MAX_TOKEN_RECOVERIES}) — encerrando execução.`
+          );
+          break;
+        }
         // Recuperação: mantém o histórico íntegro e pede continuação objetiva,
         // priorizando tool_use para evitar novo estouro por texto longo.
         messages.push({
@@ -460,11 +679,27 @@ async function doAnalysis(issueKey: string, rowId: number | null, options?: Agen
       }
     }
   } finally {
+    if (ENABLE_BUDGET && hardBudgetExceeded && !hardBudgetCommentPosted) {
+      const comment =
+        `## ⚠️ Execução interrompida por orçamento de tokens\n\n` +
+        `O agente analista interrompeu a execução ao atingir o limite hard de tokens configurado.\n\n` +
+        `**Limite configurado:** \`${MAX_TOTAL_TOKENS}\` tokens\n` +
+        `**Ação recomendada:** aumentar os limites \`ANALYST_MAX_TOTAL_TOKENS\`/\`ANALYST_MAX_TOKENS_PER_TURN\` ` +
+        `ou reexecutar a demanda para continuidade.`;
+      try {
+        await jiraAddComment(issueKey, comment);
+        hardBudgetCommentPosted = true;
+      } catch (err) {
+        console.warn(`[analyst] aviso: não foi possível postar comentário de orçamento hard: ${err}`);
+      }
+    }
+
     console.log(
       `\n[analyst] ${issueKey} — status: ${finalStatus} | turnos: ${turns}` +
         ` | tokens in: ${inputTokens} out: ${outputTokens}` +
         ` cache_read: ${cacheReadTokens} cache_write: ${cacheCreationTokens}` +
-        ` | file_reads: ${fileReadCount.n}/${MAX_FILE_READS} unique_files: ${fileAccessCount.size}`
+        ` | file_reads: ${fileReadCount.n}/${MAX_FILE_READS} unique_files: ${fileAccessCount.size}` +
+        ` | prompt_mode: ${promptController.getMode()} switches: ${promptController.getSwitches()}`
     );
 
     if (rowId !== null) {

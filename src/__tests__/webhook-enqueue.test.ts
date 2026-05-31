@@ -1,5 +1,5 @@
 import http from "node:http";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const dbPingMock = vi.fn(async () => true);
 const enqueueJobMock = vi.fn();
@@ -65,6 +65,12 @@ function samplePayload() {
 
 afterEach(() => {
   vi.clearAllMocks();
+});
+
+beforeEach(() => {
+  process.env.WEBHOOK_SIGNATURE_REQUIRED = "0";
+  process.env.JIRA_WEBHOOK_SECRET = "";
+  process.env.JIRA_WEBHOOK_SIGNATURE_HEADER = "x-hub-signature";
 });
 
 describe("webhook enqueue", () => {
