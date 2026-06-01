@@ -1104,6 +1104,7 @@ export async function dbSaveExecutionCheckpoint(input: SaveExecutionCheckpointIn
 
     const maxPerJob = getCheckpointMaxPerJob();
     if (maxPerJob > 0) {
+      const pruneLimit = Math.max(1, Math.floor(maxPerJob));
       await p.execute(
         `DELETE FROM agent_execution_checkpoints
           WHERE job_id = ?
@@ -1113,10 +1114,10 @@ export async function dbSaveExecutionCheckpoint(input: SaveExecutionCheckpointIn
                   FROM agent_execution_checkpoints
                  WHERE job_id = ?
                  ORDER BY checkpoint_seq DESC, id DESC
-                 LIMIT ?
+                 LIMIT ${pruneLimit}
               ) AS latest
             )`,
-        [input.jobId, input.jobId, maxPerJob]
+        [input.jobId, input.jobId]
       );
     }
 

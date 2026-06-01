@@ -457,13 +457,14 @@ async function doReview(issueKey: string, rowId: number | null, options?: AgentR
         ? Math.min(MAX_TOKENS_PER_TURN, SOFT_MAX_TOKENS_PER_TURN)
         : MAX_TOKENS_PER_TURN;
 
-      const { data: response, response: httpResponse } =
-        await client.messages.create({
-          model: MODEL,
-          max_tokens: currentMaxTokensPerTurn,
-          tools: TOOLS,
-          messages,
-        }).withResponse();
+      const responseStream = client.messages.stream({
+        model: MODEL,
+        max_tokens: currentMaxTokensPerTurn,
+        tools: TOOLS,
+        messages,
+      });
+      const { data: messageStream, response: httpResponse } = await responseStream.withResponse();
+      const response = await messageStream.finalMessage();
 
       lastHeaders = httpResponse.headers;
 
